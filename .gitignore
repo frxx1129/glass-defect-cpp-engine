@@ -1,16 +1,18 @@
-# 构建产物
+﻿# 构建产物
 build/
-Release/
-Debug/
+build_new/
+build*/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.tlog
+CMakeFiles/
 
-# IDE
-.vs/
-*.user
-*.suo
+# 编译缓存
+*.pyc
+__pycache__/
+.venv/
 
-# 第三方下载
-third_party/
-
-# 临时文件
-*.tmp
-*.log
+# 测试图/临时
+C:\tmp\
