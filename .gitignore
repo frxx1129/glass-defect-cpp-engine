@@ -1,0 +1,16 @@
+# 构建产物
+build/
+Release/
+Debug/
+
+# IDE
+.vs/
+*.user
+*.suo
+
+# 第三方下载
+third_party/
+
+# 临时文件
+*.tmp
+*.log
