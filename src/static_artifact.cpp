@@ -1,14 +1,15 @@
-#include "static_artifact.h"
+#include "engine/static_artifact.h"
 #include <sstream>
 #include <chrono>
 #include <cstdint>
 #include <unordered_set>
 
+StaticArtifactTracker::StaticArtifactTracker() : StaticArtifactTracker(EngineConfig()) {}
 StaticArtifactTracker::StaticArtifactTracker(const EngineConfig& config) {
-    min_consecutive_ = config.static_artifact_min_consecutive;
-    grid_size_ = config.static_artifact_grid_size;
-    cooldown_frames_ = config.static_artifact_cooldown_frames;
-    report_interval_ = config.static_artifact_report_interval;
+    min_consecutive_ = config.light.defect_detection.static_artifact_min_consecutive;
+    grid_size_ = config.light.defect_detection.static_artifact_grid_size;
+    cooldown_frames_ = config.light.defect_detection.static_artifact_cooldown_frames;
+    report_interval_ = config.light.defect_detection.static_artifact_report_interval;
 }
 
 std::string StaticArtifactTracker::make_cell_key(int cx, int cy) {
@@ -31,8 +32,8 @@ std::vector<Defect> StaticArtifactTracker::filter(
     // ---- 当前帧缺陷位置网格化 ----
     std::unordered_set<std::string> current_cells;
     for (const auto& defect : defects) {
-        int gx = defect.location.x;
-        int gy = defect.location.y;
+        int gx = defect.x;
+        int gy = defect.y;
         if (gx < 0 || gy < 0) continue;
         int cx = (gx / grid_size_) * grid_size_;
         int cy = (gy / grid_size_) * grid_size_;
@@ -85,8 +86,8 @@ std::vector<Defect> StaticArtifactTracker::filter(
     std::vector<Defect> filtered;
     int suppressed_count = 0;
     for (const auto& defect : defects) {
-        int gx = defect.location.x;
-        int gy = defect.location.y;
+        int gx = defect.x;
+        int gy = defect.y;
         int cx = (gx / grid_size_) * grid_size_;
         int cy = (gy / grid_size_) * grid_size_;
         std::string cell_key = make_cell_key(cx, cy);

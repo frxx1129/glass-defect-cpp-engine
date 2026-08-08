@@ -1,0 +1,82 @@
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      The system is: Windows - 10.0.19045 - 
+  -
+    kind: "find-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompilerId.cmake:468 (find_file)"
+      - "C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompilerId.cmake:506 (CMAKE_DETERMINE_COMPILER_ID_WRITE)"
+      - "C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompilerId.cmake:8 (CMAKE_DETERMINE_COMPILER_ID_BUILD)"
+      - "C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeDetermineCXXCompiler.cmake:125 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:2 (project)"
+    mode: "file"
+    variable: "src_in"
+    description: "Path to a file."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "CMakeCXXCompilerId.cpp.in"
+    candidate_directories:
+      - "C:/Program Files/CMake/share/cmake-4.3/Modules/"
+    found: "C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeCXXCompilerId.cpp.in"
+    search_context:
+      ENV{PATH}:
+        - "F:\\VS2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\HostX64\\x64"
+        - "F:\\VS2022\\BuildTools\\Common7\\IDE\\VC\\VCPackages"
+        - "F:\\VS2022\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\TestWindow"
+        - "F:\\VS2022\\BuildTools\\MSBuild\\Current\\bin\\Roslyn"
+        - "F:\\VS2022\\BuildTools\\Team Tools\\DiagnosticsHub\\Collector"
+        - "F:\\VS2022\\BuildTools\\Common7\\IDE\\Extensions\\Microsoft\\CodeCoverage.Console"
+        - "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\\\x64"
+        - "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\\\x64"
+        - "F:\\VS2022\\BuildTools\\\\MSBuild\\Current\\Bin\\amd64"
+        - "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319"
+        - "F:\\VS2022\\BuildTools\\Common7\\IDE\\"
+        - "F:\\VS2022\\BuildTools\\Common7\\Tools\\"
+        - "C:\\Users\\Admin\\.codex\\tmp\\arg0\\codex-arg0VCgRPz"
+        - "C:\\Users\\Admin\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\bin\\override"
+        - "C:\\Program Files\\Common Files\\Oracle\\Java\\javapath"
+        - "C:\\Windows\\system32"
+        - "C:\\Windows"
+        - "C:\\Windows\\System32\\Wbem"
+        - "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\"
+        - "C:\\Windows\\System32\\OpenSSH\\"
+        - "C:\\Program Files (x86)\\NVIDIA Corporation\\PhysX\\Common"
+        - "C:\\Program Files\\NVIDIA Corporation\\NVIDIA NvDLISR"
+        - "E:\\matlab\\bin"
+        - "C:\\Program Files\\CMake\\bin"
+        - "C:\\Program Files\\CMake\\bin"
+        - "F:\\NodeJS\\"
+        - "C:\\Program Files\\Git\\cmd"
+        - "F:\\Python312\\Scripts\\"
+        - "F:\\Python312\\"
+        - "C:\\Program Files (x86)\\GNU Arm Embedded Toolchain\\10 2021.10\\bin"
+        - "C:\\Users\\Admin\\10 2021.10\\bin"
+        - "D:\\10 2021.10\\bin"
+        - "F:\\ff\\Python\\Scripts\\"
+        - "F:\\ff\\Python\\"
+        - "C:\\Users\\Admin\\AppData\\Local\\Programs\\Python\\Launcher\\"
+        - "C:\\Users\\Admin\\AppData\\Local\\Microsoft\\WindowsApps"
+        - "F:\\ff\\Python\\PyCharm Community Edition 2024.3.5\\bin"
+        - "E:\\Microsoft VS Code\\bin"
+        - "C:\\Users\\Admin\\10 2021.10\\bin"
+        - "C:\\Users\\Admin\\10 2021.10\\bin"
+        - "F:\\npm_global"
+        - "F:\\opencv\\opencv\\build\\x64\\vc16\\bin"
+        - "E:\\npm-global"
+        - "C:\\Users\\Admin\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\bin\\fallback"
+        - "C:\\Users\\Admin\\.cache\\codex-runtimes\\codex-primary-runtime\\d
