@@ -1,11 +1,14 @@
-﻿#include "engine/detector.h"
+#include "engine/detector.h"
 #include "engine/preprocess.h"
 #include "engine/line_merge.h"
 #include "engine/classify.h"
+#include "engine/skew.h"
+#include "engine/luminosity.h"
 #include "engine/json_io.h"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <fstream>
+#include <iostream>
 #include <algorithm>
 #include <cmath>
 
@@ -75,32 +78,112 @@ std::vector<Defect> Detector::process_roi(
     // 预处理（Hough 版，含兜底增强）
     cv::Mat edges = preprocess_for_hough_enhanced(roi_gray, params.preprocessing);
 
-    // Hough 直线
+    // Hough 直线（镜像 Python：先按 DOWNSAMPLE_SCALE 降采样再放大回原图）
     std::vector<cv::Vec4i> lines;
     {
+        // 最小线段长度：镜像 Python MIN_LINE_LENGTH_MODE="min"（min(ROI宽,高) x 比例，不设下限）
         double min_len = params.hough.min_line_length;
         if (params.hough.min_line_length_ratio > 0) {
-            double diag = std::sqrt(double(roi_gray.cols) * double(roi_gray.cols) +
-                                    double(roi_gray.rows) * double(roi_gray.rows));
-            min_len = std::max(min_len, diag * params.hough.min_line_length_ratio);
+            double min_base = std::min(roi_gray.cols, roi_gray.rows);
+            min_len = min_base * params.hough.min_line_length_ratio;
         }
-        if (params.hough.max_line_gap_mm > 0) {
-            // MAX_LINE_GAP_MM 优先于像素版
+        // Python DOWNSAMPLE_SCALE 默认 0.85
+        double ds_scale = 0.85;
+        if (ds_scale < 0.999) {
+            int w_full = edges.cols, h_full = edges.rows;
+            int w_small = std::max(1, (int)std::lround(w_full * ds_scale));
+            int h_small = std::max(1, (int)std::lround(h_full * ds_scale));
+            cv::Mat edges_small;
+            cv::resize(edges, edges_small, cv::Size(w_small, h_small), 0, 0, cv::INTER_AREA);
+            double scale_x = (double)w_full / w_small;
+            double scale_y = (double)h_full / h_small;
+            double scale_len = std::min(1.0, std::min(w_small / (double)std::max(1, w_full),
+                                                      h_small / (double)std::max(1, h_full)));
+            int min_len_small = std::max(1, (int)std::lround(min_len * scale_len));
+            double max_gap_full = params.hough.max_line_gap_mm > 0
+                ? params.hough.max_line_gap_mm * px_per_mm_ : params.hough.max_line_gap;
+            int max_gap_small = std::max(0, (int)std::lround(max_gap_full * scale_len));
+            std::vector<cv::Vec4i> raw_small;
+            cv::HoughLinesP(edges_small, raw_small,
+                            params.hough.rho,
+                            params.hough.theta_deg * CV_PI / 180.0,
+                            params.hough.threshold,
+                            min_len_small,
+                            max_gap_small);
+            // 坐标放大回原图
+            for (auto& l : raw_small) {
+                l[0] = (int)std::lround(l[0] * scale_x);
+                l[1] = (int)std::lround(l[1] * scale_y);
+                l[2] = (int)std::lround(l[2] * scale_x);
+                l[3] = (int)std::lround(l[3] * scale_y);
+            }
+            lines = raw_small;
+        } else {
+            double max_gap_full = params.hough.max_line_gap_mm > 0
+                ? params.hough.max_line_gap_mm * px_per_mm_ : params.hough.max_line_gap;
+            cv::HoughLinesP(edges, lines,
+                            params.hough.rho,
+                            params.hough.theta_deg * CV_PI / 180.0,
+                            params.hough.threshold,
+                            min_len,
+                            max_gap_full);
         }
-        cv::HoughLinesP(edges, lines,
-                        params.hough.rho,
-                        params.hough.theta_deg * CV_PI / 180.0,
-                        params.hough.threshold,
-                        min_len,
-                        params.hough.max_line_gap);
     }
 
     // 直线合并
     auto merged = merge_lines_and_get_main_edges(lines, params, px_per_mm_, edges);
 
-    // 缺陷分类
-    auto defects = find_and_analyze_defects(merged, roi_gray, roi_gray.size(), params, px_per_mm_);
+    // 缺陷来源 1：亮度扫描（沿主边扫描暗区 → B 崩边候选，镜像 Python scan_edge_for_luminosity_defects）
+    std::vector<Defect> defects;
+    for (auto& ml : merged) {
+        auto contours = scan_edge_for_luminosity_defects(roi_gray, ml.line, params, px_per_mm_);
+        for (auto& cnt : contours) {
+            cv::RotatedRect rr = cv::minAreaRect(cnt);
+            cv::Point2f pts[4];
+            rr.points(pts);
+            Defect d;
+            d.type = "B";
+            d.confidence = 0.65;
+            for (auto& pt : pts)
+                d.box_points.push_back(cv::Point((int)std::lround(pt.x), (int)std::lround(pt.y)));
+            d.x = (int)std::lround(rr.center.x);
+            d.y = (int)std::lround(rr.center.y);
+            double w_px = std::max(rr.size.width, rr.size.height);
+            double h_px = std::min(rr.size.width, rr.size.height);
+            d.length_mm = w_px / px_per_mm_;
+            d.width_mm = h_px / px_per_mm_;
+            d.size_mm = d.length_mm;
+            d.roi_index = roi_idx;
+            defects.push_back(d);
+        }
+    }
     for (auto& d : defects) d.roi_index = roi_idx;
+
+    // 缺陷来源 2：E 型边缘异常（缺陷边缘图 + 主边屏蔽带 + 轮廓分析）
+    cv::Mat defect_edges = preprocess_for_defect_edges(roi_gray, params.preprocessing);
+    auto e_defects = detect_e_defects(roi_gray, defect_edges, merged, params, px_per_mm_);
+    for (auto& d : e_defects) d.roi_index = roi_idx;
+    defects.insert(defects.end(), e_defects.begin(), e_defects.end());
+
+    // 预过滤（镜像 Python QBL_PREFILTER_MIN_WIDTH）：Q/B/L 宽度 < PREFILTER_MIN_WIDTH_MM 过滤
+    double prefilter_min_width = params.defect_detection.prefilter_min_width_mm > 0
+        ? params.defect_detection.prefilter_min_width_mm
+        : params.defect_detection.min_width_mm;
+    if (prefilter_min_width > 0) {
+        std::vector<Defect> kept;
+        for (auto& d : defects) {
+            if (d.type == "Q" || d.type == "B" || d.type == "L") {
+                if (d.width_mm < prefilter_min_width) continue;
+                // Q 长度范围过滤
+                if (d.type == "Q" && params.defect_detection.q_length_range_filter_enable) {
+                    if (d.length_mm < params.defect_detection.q_length_min_mm ||
+                        d.length_mm > params.defect_detection.q_length_max_mm) continue;
+                }
+            }
+            kept.push_back(d);
+        }
+        defects = kept;
+    }
 
     // 坐标还原到全图
     for (auto& d : defects) { d.x += roi.x; d.y += roi.y; }
