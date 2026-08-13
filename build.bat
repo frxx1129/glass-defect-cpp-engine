@@ -9,7 +9,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 cd /d %~dp0
 if not exist build_new mkdir build_new
-cl /nologo /std:c++20 /utf-8 /EHsc /O2 /DNDEBUG /I include /I third_party\nlohmann /I F:\opencv\opencv\build\include src\json_io.cpp src\preprocess.cpp src\line_merge.cpp src\classify.cpp src\static_artifact.cpp src\detector.cpp src\main.cpp /Fe:build_new\glass_engine.exe /link F:\opencv\opencv\build\x64\vc16\lib\opencv_world4100.lib
+cl /nologo /std:c++20 /utf-8 /EHsc /O2 /DNDEBUG /I include /I third_party\nlohmann /I F:\opencv\opencv\build\include src\json_io.cpp src\preprocess.cpp src\line_merge.cpp src\classify.cpp src\static_artifact.cpp src\detector.cpp src\skew.cpp src\luminosity.cpp src\corner.cpp src\main.cpp /Fe:build_new\glass_engine.exe /link F:\opencv\opencv\build\x64\vc16\lib\opencv_world4100.lib
 if %ERRORLEVEL% NEQ 0 (
     echo BUILD FAILED
     pause
