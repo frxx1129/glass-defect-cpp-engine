@@ -4,6 +4,7 @@
 #include "engine/classify.h"
 #include "engine/skew.h"
 #include "engine/luminosity.h"
+#include "engine/corner.h"
 #include "engine/json_io.h"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -133,37 +134,219 @@ std::vector<Defect> Detector::process_roi(
     // 直线合并
     auto merged = merge_lines_and_get_main_edges(lines, params, px_per_mm_, edges);
 
-    // 缺陷来源 1：亮度扫描（沿主边扫描暗区 → B 崩边候选，镜像 Python scan_edge_for_luminosity_defects）
-    std::vector<Defect> defects;
+#ifdef CPP_DEBUG_MERGED
     for (auto& ml : merged) {
-        auto contours = scan_edge_for_luminosity_defects(roi_gray, ml.line, params, px_per_mm_);
-        for (auto& cnt : contours) {
-            cv::RotatedRect rr = cv::minAreaRect(cnt);
-            cv::Point2f pts[4];
-            rr.points(pts);
-            Defect d;
-            d.type = "B";
-            d.confidence = 0.65;
-            for (auto& pt : pts)
-                d.box_points.push_back(cv::Point((int)std::lround(pt.x), (int)std::lround(pt.y)));
-            d.x = (int)std::lround(rr.center.x);
-            d.y = (int)std::lround(rr.center.y);
-            double w_px = std::max(rr.size.width, rr.size.height);
-            double h_px = std::min(rr.size.width, rr.size.height);
-            d.length_mm = w_px / px_per_mm_;
-            d.width_mm = h_px / px_per_mm_;
-            d.size_mm = d.length_mm;
-            d.roi_index = roi_idx;
-            defects.push_back(d);
+        std::cerr << "[MERGED] roi=" << roi_idx << " (" << ml.line[0] << "," << ml.line[1]
+                  << ")->(" << ml.line[2] << "," << ml.line[3] << ") ang=" << ml.angle_deg
+                  << " len=" << ml.length_px << std::endl;
+    }
+#endif
+
+    // 缺陷来源 1：亮度扫描（沿主边扫描暗区 → B 崩边候选，镜像 Python scan_edge_for_luminosity_defects）
+    // Python 流程：收集所有主边的扫描轮廓 -> 填充画布 -> MORPH_CLOSE 闭运算合并 -> 重新 findContours
+    // -> 面积过滤 -> 逐轮廓生成 B。此处 C++ 同步镜像，否则相邻小轮廓会各自成 B，与 Python 不一致。
+    // Vertical edge extension to ROI boundary (mirror Python ENABLE_VERTICAL_EXTENSION_FOR_Q + _clip_infinite_line_to_roi)
+    {
+        double v_ext_min_len_px = 5.0 * px_per_mm_;
+        double v_tol = params.defect_detection.vertical_angle_tol_deg;
+        for (auto& ml : merged) {
+            double dx = ml.line[2] - ml.line[0];
+            double dy = ml.line[3] - ml.line[1];
+            double len = std::hypot(dx, dy);
+            if (len < v_ext_min_len_px) continue;
+            double ang = std::abs(std::atan2(dy, dx)) * 180.0 / CV_PI;
+            if (ang > 90.0) ang = 180.0 - ang;
+            if (ang >= (90.0 - v_tol)) {
+                double x1 = ml.line[0], y1 = ml.line[1];
+                double x2 = ml.line[2], y2 = ml.line[3];
+                double ddx = x2 - x1, ddy = y2 - y1;
+                if (!(std::abs(ddx) < 1e-9 && std::abs(ddy) < 1e-9)) {
+                    std::vector<cv::Point2d> cand;
+                    double W = (double)(roi_gray.cols - 1);
+                    double H = (double)(roi_gray.rows - 1);
+                    if (std::abs(ddx) >= 1e-9) {
+                        for (double xk : {0.0, W}) {
+                            double t = (xk - x1) / ddx;
+                            double yk = y1 + t * ddy;
+                            if (yk >= 0.0 && yk <= H) cand.push_back(cv::Point2d(xk, yk));
+                        }
+                    }
+                    if (std::abs(ddy) >= 1e-9) {
+                        for (double yk : {0.0, H}) {
+                            double t = (yk - y1) / ddy;
+                            double xk = x1 + t * ddx;
+                            if (xk >= 0.0 && xk <= W) cand.push_back(cv::Point2d(xk, yk));
+                        }
+                    }
+                    std::vector<cv::Point2d> uniq;
+                    for (auto& p : cand) {
+                        bool dup = false;
+                        for (auto& q : uniq) {
+                            if (std::abs(p.x - q.x) < 0.5 && std::abs(p.y - q.y) < 0.5) { dup = true; break; }
+                        }
+                        if (!dup) uniq.push_back(p);
+                    }
+                    if (uniq.size() >= 2) {
+                        int ia = 0, ib = 1;
+                        double best = -1;
+                        for (size_t a = 0; a < uniq.size(); a++) {
+                            for (size_t b = a + 1; b < uniq.size(); b++) {
+                                double d = std::hypot(uniq[b].x - uniq[a].x, uniq[b].y - uniq[a].y);
+                                if (d > best) { best = d; ia = (int)a; ib = (int)b; }
+                            }
+                        }
+                        ml.line = cv::Vec4d(uniq[ia].x, uniq[ia].y, uniq[ib].x, uniq[ib].y);
+                        ml.length_px = std::hypot(ml.line[2] - ml.line[0], ml.line[3] - ml.line[1]);
+                        double na = std::abs(std::atan2(ml.line[3] - ml.line[1], ml.line[2] - ml.line[0])) * 180.0 / CV_PI;
+                        ml.angle_deg = na > 90.0 ? 180.0 - na : na;
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<Defect> defects;
+    {
+        std::vector<std::vector<cv::Point>> all_chipping_contours;
+        for (auto& ml : merged) {
+            auto contours = scan_edge_for_luminosity_defects(roi_gray, ml.line, params, px_per_mm_);
+            for (auto& cnt : contours) all_chipping_contours.push_back(cnt);
+        }
+        if (!all_chipping_contours.empty()) {
+            cv::Mat defect_canvas = cv::Mat::zeros(roi_gray.size(), CV_8U);
+            cv::drawContours(defect_canvas, all_chipping_contours, -1, cv::Scalar(255), -1);
+
+            // MORPH_CLOSE 核尺寸：优先 MERGE_DEFECTS_KERNEL_MM * px_per_mm 转奇数，否则用 KERNEL_SIZE
+            int kx = params.defect_detection.merge_defects_kernel_size.size() > 0
+                ? params.defect_detection.merge_defects_kernel_size[0] : 9;
+            int ky = params.defect_detection.merge_defects_kernel_size.size() > 1
+                ? params.defect_detection.merge_defects_kernel_size[1] : 9;
+            if (params.defect_detection.merge_defects_kernel_mm.size() >= 2) {
+                int kx_mm = (int)std::lround(params.defect_detection.merge_defects_kernel_mm[0] * px_per_mm_);
+                int ky_mm = (int)std::lround(params.defect_detection.merge_defects_kernel_mm[1] * px_per_mm_);
+                if (kx_mm >= 1) kx = (kx_mm % 2 == 0) ? kx_mm + 1 : kx_mm;
+                if (ky_mm >= 1) ky = (ky_mm % 2 == 0) ? ky_mm + 1 : ky_mm;
+            }
+            cv::Mat kernel = cv::Mat::ones(kx, ky, CV_8U);
+            cv::Mat merged_mask;
+            cv::morphologyEx(defect_canvas, merged_mask, cv::MORPH_CLOSE, kernel, cv::Point(-1, -1), 2);
+
+            std::vector<std::vector<cv::Point>> final_contours;
+            cv::findContours(merged_mask, final_contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+            double min_area_px2 = params.defect_detection.luminosity_min_area_mm2 > 0
+                ? params.defect_detection.luminosity_min_area_mm2 * px_per_mm_ * px_per_mm_
+                : params.defect_detection.luminosity_min_area;
+
+            for (auto& cnt : final_contours) {
+                if (std::abs(cv::contourArea(cnt)) < min_area_px2) continue;
+                cv::RotatedRect rr = cv::minAreaRect(cnt);
+                cv::Point2f pts[4];
+                rr.points(pts);
+                Defect d;
+                d.type = "B";
+                d.confidence = 0.65;
+                for (auto& pt : pts)
+                    d.box_points.push_back(cv::Point((int)std::lround(pt.x), (int)std::lround(pt.y)));
+                d.region_contour = cnt;   // 保留合并后轮廓（阴影过滤用）
+                d.x = (int)std::lround(rr.center.x);
+                d.y = (int)std::lround(rr.center.y);
+                double w_px = std::max(rr.size.width, rr.size.height);
+                double h_px = std::min(rr.size.width, rr.size.height);
+                d.length_mm = w_px / px_per_mm_;
+                d.width_mm = h_px / px_per_mm_;
+                d.size_mm = d.length_mm;
+                d.roi_index = roi_idx;
+                defects.push_back(d);
+            }
         }
     }
     for (auto& d : defects) d.roi_index = roi_idx;
+
+    // B 过滤链（镜像 Python final_chipping_defects / report 阶段 B 规则）
+    {
+        std::vector<Defect> b_filtered;
+        for (auto& d : defects) {
+            if (d.type != "B") { b_filtered.push_back(d); continue; }
+            // 从 box_points 重算 minAreaRect
+            cv::RotatedRect rr = cv::minAreaRect(d.box_points);
+            double w_px = std::max(rr.size.width, rr.size.height);
+            double h_px = std::min(rr.size.width, rr.size.height);
+            double width_mm = h_px / px_per_mm_;
+            double length_mm = w_px / px_per_mm_;
+            double ar = h_px > 1e-6 ? w_px / h_px : 1e9;
+
+            // 1) 细长窄门控：ar>10 且宽<2mm → 距主边 >5mm 过滤
+            double ar_min_gate = params.defect_detection.b_filter_parallel_ar_min > 0
+                ? params.defect_detection.b_filter_parallel_ar_min : 10.0;
+            double min_side_gate = params.defect_detection.b_filter_parallel_min_side_mm > 0
+                ? params.defect_detection.b_filter_parallel_min_side_mm : 2.0;
+            double max_edge_dist = params.defect_detection.b_max_distance_to_edge_mm > 0
+                ? params.defect_detection.b_max_distance_to_edge_mm : 5.0;
+            if (ar > ar_min_gate && width_mm < min_side_gate) {
+                cv::Point2d center(rr.center.x, rr.center.y);
+                double min_d = 1e18;
+                for (auto& ml : merged) {
+                    double dpx = std::abs((ml.line[2]-ml.line[0]) * (ml.line[1]-center.y) -
+                                          (ml.line[3]-ml.line[1]) * (ml.line[0]-center.x)) /
+                                 std::max(1e-6, ml.length_px);
+                    min_d = std::min(min_d, dpx);
+                }
+                if (min_d > max_edge_dist * px_per_mm_) continue; // 距主边过远，过滤
+            }
+            // 2) 阴影过滤：contour 面积 / minAreaRect 面积 < SHADOW_FILTER_MIN_EXTENT_RATIO
+            if (!d.region_contour.empty()) {
+                double contour_area = std::abs(cv::contourArea(d.region_contour));
+                double rect_area = w_px * h_px;
+                double min_extent = params.defect_detection.shadow_filter_min_extent_ratio > 0
+                    ? params.defect_detection.shadow_filter_min_extent_ratio : 0.25;
+                if (rect_area > 1e-6 && (contour_area / rect_area) < min_extent) continue;
+            }
+            // 3) MIN_WIDTH 过滤（未转 L 的 B）：宽 < MIN_WIDTH_MM 过滤
+            double min_width_rule = params.defect_detection.min_width_mm > 0
+                ? params.defect_detection.min_width_mm : 5.0;
+            if (width_mm < min_width_rule) continue;
+            // 4) 面积/宽度启发式：面积<25mm2 且宽<5mm 过滤
+            double area_mm2 = length_mm * width_mm;
+            if (area_mm2 < 25.0 && width_mm < params.defect_detection.min_defect_size_mm) continue;
+
+            // 5) B→L 重分类：ar>7.5 且长边近似垂直主边（角度差 > 90-tol）
+            double min_ar_l = params.defect_detection.b_to_l_min_ar > 0
+                ? params.defect_detection.b_to_l_min_ar : 7.5;
+            double perp_tol = params.defect_detection.b_to_l_perp_tolerance_deg > 0
+                ? params.defect_detection.b_to_l_perp_tolerance_deg : 10.0;
+            if (ar > min_ar_l) {
+                // 长边方向（minAreaRect 长边角度）
+                double long_ang = rr.angle;
+                if (w_px < h_px) long_ang += 90.0;
+                long_ang = std::fmod(std::abs(long_ang), 180.0);
+                if (long_ang > 90.0) long_ang = 180.0 - long_ang;
+                bool is_perp = false;
+                for (auto& ml : merged) {
+                    double ang_diff = std::abs(ml.angle_deg - long_ang);
+                    ang_diff = std::min(ang_diff, 180.0 - ang_diff);
+                    if (ang_diff >= (90.0 - perp_tol)) { is_perp = true; break; }
+                }
+                if (is_perp) d.type = "L";
+            }
+            d.width_mm = width_mm;
+            d.length_mm = length_mm;
+            d.size_mm = std::max(width_mm, length_mm);
+            b_filtered.push_back(d);
+        }
+        defects = b_filtered;
+    }
 
     // 缺陷来源 2：E 型边缘异常（缺陷边缘图 + 主边屏蔽带 + 轮廓分析）
     cv::Mat defect_edges = preprocess_for_defect_edges(roi_gray, params.preprocessing);
     auto e_defects = detect_e_defects(roi_gray, defect_edges, merged, params, px_per_mm_);
     for (auto& d : e_defects) d.roi_index = roi_idx;
     defects.insert(defects.end(), e_defects.begin(), e_defects.end());
+
+    // 缺陷来源 3：Q 角点（缺角）检测（角点配对 + 射线求交 + 三角形判定）
+    auto q_defects = detect_q_defects(roi_gray, merged, defect_edges, params, px_per_mm_);
+    for (auto& d : q_defects) d.roi_index = roi_idx;
+    defects.insert(defects.end(), q_defects.begin(), q_defects.end());
 
     // 预过滤（镜像 Python QBL_PREFILTER_MIN_WIDTH）：Q/B/L 宽度 < PREFILTER_MIN_WIDTH_MM 过滤
     double prefilter_min_width = params.defect_detection.prefilter_min_width_mm > 0

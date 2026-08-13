@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <iostream>
 #include <map>
 
 namespace {
@@ -137,6 +138,12 @@ std::vector<Defect> detect_e_defects(
         }
     }
 
+#ifdef CPP_DEBUG_E
+    std::cerr << "[E] roi edges_base=" << cv::countNonZero(edges_base)
+              << " edges_work=" << cv::countNonZero(edges_work)
+              << " mask=" << (mask_lines.empty() ? 0 : cv::countNonZero(mask_lines)) << std::endl;
+#endif
+
     // ---- 2. 快速预过滤 ----
     bool skip_e_contours = false;
     if (dd.e_fast_prefilter_enable) {
@@ -167,6 +174,7 @@ std::vector<Defect> detect_e_defects(
         double min_len_px_for_main = dd.e_from_main_edge_min_len_mm * px_per_mm;
         for (auto& ml : true_edges) {
             double ang = ml.angle_deg;
+
             if (ang <= h_tol || ang >= (90.0 - v_tol)) continue;
             if (ml.length_px < min_len_px_for_main) continue;
             double xmn = std::min(ml.line[0], ml.line[2]);
@@ -194,6 +202,10 @@ std::vector<Defect> detect_e_defects(
     }
 
     // ---- 4. 轮廓分析 ----
+#ifdef CPP_DEBUG_E
+    std::cerr << "[E] skip_e_contours=" << skip_e_contours << " prefilter_px=" << (dd.e_fast_prefilter_enable ? std::to_string(cv::countNonZero(edges_work)) : std::string("off")) << std::endl;
+#endif
+
     std::vector<Defect> contour_defects;
     if (!skip_e_contours) {
         std::vector<std::vector<cv::Point>> contours;
@@ -214,11 +226,16 @@ std::vector<Defect> detect_e_defects(
             double ang = std::abs(rect.angle);
             if (rect.size.width < rect.size.height) ang = std::abs(rect.angle + 90.0);
             if (ang > 90.0) ang -= 90.0;
+
             if (ang <= h_tol || ang >= (90.0 - v_tol)) continue;
 
             cv::Point2f box_pts[4];
             rect.points(box_pts);
             cv::Rect bb = cv::boundingRect(std::vector<cv::Point2f>(box_pts, box_pts + 4));
+#ifdef CPP_DEBUG_E
+            std::cerr << "[E] cnt long=" << long_side << " area=" << area << " ang=" << ang
+                      << " bbox=(" << bb.x << "," << bb.y << "," << bb.width << "," << bb.height << ")" << std::endl;
+#endif
 
             // 位置过滤：靠近 ROI 边界 OR 靠近主边
             double border_dist = std::min({(double)bb.x, (double)bb.y,

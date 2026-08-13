@@ -128,6 +128,41 @@ bool canny_gap_blocks_merge(const cv::Mat& edge_img, const cv::Vec4i& ref,
     return false;
 }
 
+// 两直线交点（无限延长），平行返回 false（镜像 Python find_line_intersection）
+inline bool line_intersection_inf(const cv::Vec4d& a, const cv::Vec4d& b, cv::Point2d& out) {
+    double ax = a[2] - a[0], ay = a[3] - a[1];
+    double bx = b[2] - b[0], by = b[3] - b[1];
+    double denom = ax * by - ay * bx;
+    if (std::abs(denom) < 1e-9) return false;
+    double t = ((b[0] - a[0]) * by - (b[1] - a[1]) * bx) / denom;
+    out = cv::Point2d(a[0] + t * ax, a[1] + t * ay);
+    return true;
+}
+
+// 点在直线上的 t 参数、垂距、线段长度（镜像 Python _t_param_and_perp_dist）
+inline void t_param_and_perp_dist(const cv::Point2d& pt, const cv::Point2d& a, const cv::Point2d& b,
+                                  double& t, double& d_perp, double& len) {
+    cv::Point2d v = b - a;
+    double denom = v.x * v.x + v.y * v.y;
+    if (denom < 1e-8) { t = 0.0; d_perp = std::hypot(pt.x - a.x, pt.y - a.y); len = 0.0; return; }
+    t = ((pt.x - a.x) * v.x + (pt.y - a.y) * v.y) / denom;
+    cv::Point2d proj = a + t * v;
+    d_perp = std::hypot(pt.x - proj.x, pt.y - proj.y);
+    len = std::sqrt(denom);
+}
+
+// 两直线角度差（归一化到 [0, 90]）（镜像 Python diff_deg）
+inline double angle_diff_deg(const cv::Vec4d& a, const cv::Vec4d& b) {
+    auto ang = [](const cv::Vec4d& l) {
+        double dx = l[2] - l[0], dy = l[3] - l[1];
+        double aa = std::atan2(dy, dx) * 180.0 / CV_PI;
+        if (aa < 0) aa += 180.0;
+        return aa;
+    };
+    double da = std::abs(ang(a) - ang(b));
+    return std::min(da, 180.0 - da);
+}
+
 } // namespace
 
 std::vector<MergedLine> merge_lines_and_get_main_edges(
@@ -337,6 +372,61 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                         if (row_sum > best_sum) { best_sum = row_sum; cy_best = cy; }
                     }
                     final_line = cv::Vec4d(x0s, cy_best, x1s, cy_best);
+
+                    // 水平连接性校验（镜像 Python HORIZONTAL_CONNECTIVITY）：
+                    // group 内线段按 x 投影排序，相邻段 gap>=8px 且 Canny 无边缘连续>=25px -> 拆回最长段
+                    if (group.size() >= 2) {
+                        struct XSeg { double a, b; cv::Vec4i ln; };
+                        std::vector<XSeg> segs_proj;
+                        for (auto& ln : group) {
+                            double xa = std::min((double)ln[0], (double)ln[2]);
+                            double xb = std::max((double)ln[0], (double)ln[2]);
+                            segs_proj.push_back({xa, xb, ln});
+                        }
+                        std::sort(segs_proj.begin(), segs_proj.end(),
+                                  [](const XSeg& u, const XSeg& v) { return u.a < v.a; });
+                        const double gap_min_px = 8.0;
+                        const double gap_no_edge_allow = 25.0;
+                        const int stripe_half = 2;
+                        bool connectivity_ok = true;
+                        for (size_t k = 0; k + 1 < segs_proj.size() && connectivity_ok; k++) {
+                            double a1 = segs_proj[k].b;
+                            double b0 = segs_proj[k + 1].a;
+                            double gap_len = b0 - a1;
+                            if (gap_len < gap_min_px) continue;
+                            int steps = std::max(1, (int)gap_len);
+                            int no_edge_run = 0;
+                            for (int s = 0; s <= steps; s++) {
+                                double xpos = a1 + gap_len * (double)s / std::max(1, steps);
+                                int cx = (int)std::lround(xpos);
+                                int xa = std::max(0, cx - stripe_half);
+                                int xb = std::min(w_img - 1, cx + stripe_half);
+                                int ya = std::max(0, cy_best - stripe_half);
+                                int yb = std::min(h_img - 1, cy_best + stripe_half);
+                                bool hit = false;
+                                if (xa <= xb && ya <= yb) {
+                                    for (int yy = ya; yy <= yb && !hit; yy++)
+                                        for (int xx = xa; xx <= xb && !hit; xx++)
+                                            if (edge_img.at<uchar>(yy, xx) > 0) hit = true;
+                                }
+                                if (hit) no_edge_run = 0;
+                                else {
+                                    no_edge_run++;
+                                    if (no_edge_run >= gap_no_edge_allow) { connectivity_ok = false; break; }
+                                }
+                            }
+                        }
+                        if (!connectivity_ok) {
+                            // 回退：保留 group 中支持度最高的水平线段（最长）
+                            const cv::Vec4i* best_ln = &group[0];
+                            double best_len = -1;
+                            for (auto& ln : group) {
+                                double L = std::hypot(ln[2] - ln[0], ln[3] - ln[1]);
+                                if (L > best_len) { best_len = L; best_ln = &ln; }
+                            }
+                            final_line = cv::Vec4d((*best_ln)[0], (*best_ln)[1], (*best_ln)[2], (*best_ln)[3]);
+                        }
+                    }
                 }
             }
 
@@ -355,5 +445,75 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
     std::sort(result.begin(), result.end(),
               [](const MergedLine& a, const MergedLine& b) { return a.length_px > b.length_px; });
     if ((int)result.size() > p.top_n_edges) result.resize(p.top_n_edges);
+
+    // ===== 交点裁剪/延长（镜像 Python merge 的端点交点对齐，2060-2231）=====
+    // 把线段端点延长/裁剪到与其他线段的交点，使斜边端点对齐到水平/竖直边交点。
+    {
+        int m = (int)result.size();
+        if (m > 1) {
+            const double extend_margin = 5.0 * px_per_mm;    // 5mm
+            const double ortho_extend = 30.0 * px_per_mm;    // INTERSECTION_ORTHO_EXTEND_MM
+            const double ortho_accept_deg = 60.0;
+
+            struct InterRec { cv::Point2d pt; double t; };
+            std::vector<InterRec> best0(m), best1(m);
+            std::vector<char> has0(m, 0), has1(m, 0);
+            std::vector<double> score0(m, 1e18), score1(m, 1e18);
+
+            for (int i = 0; i < m; i++) {
+                const cv::Vec4d& li = result[i].line;
+                cv::Point2d ai(li[0], li[1]), bi(li[2], li[3]);
+                for (int j = i + 1; j < m; j++) {
+                    const cv::Vec4d& lj = result[j].line;
+                    cv::Point2d aj(lj[0], lj[1]), bj(lj[2], lj[3]);
+                    cv::Point2d inter;
+                    if (!line_intersection_inf(li, lj, inter)) continue;
+
+                    double t_i, d_i, len_i, t_j, d_j, len_j;
+                    t_param_and_perp_dist(inter, ai, bi, t_i, d_i, len_i);
+                    t_param_and_perp_dist(inter, aj, bj, t_j, d_j, len_j);
+                    if (len_i < 1e-6 || len_j < 1e-6) continue;
+
+                    double ext_tol_i = extend_margin / len_i;
+                    double ext_tol_j = extend_margin / len_j;
+                    double diff_deg = angle_diff_deg(li, lj);
+                    bool near_line = (d_i < 1.5) && (d_j < 1.5);
+                    if (diff_deg >= ortho_accept_deg) {
+                        near_line = true;
+                        ext_tol_i = std::max(ext_tol_i, ortho_extend / len_i);
+                        ext_tol_j = std::max(ext_tol_j, ortho_extend / len_j);
+                    }
+                    bool within_i = (-ext_tol_i <= t_i && t_i <= 1.0 + ext_tol_i);
+                    bool within_j = (-ext_tol_j <= t_j && t_j <= 1.0 + ext_tol_j);
+                    if (!(near_line && within_i && within_j)) continue;
+
+                    auto upd = [&](InterRec& rec, char& has, double& sc, double t, double end,
+                                   const cv::Point2d& pt) {
+                        bool inside = (t >= 0.0 && t <= 1.0);
+                        double cand = (inside ? 0.0 : 1.0) * 1e6 + std::abs(t - end);
+                        if (!has || cand < sc) { rec = {pt, t}; has = 1; sc = cand; }
+                    };
+                    if (t_i <= 0.5) upd(best0[i], has0[i], score0[i], t_i, 0.0, inter);
+                    else upd(best1[i], has1[i], score1[i], t_i, 1.0, inter);
+                    if (t_j <= 0.5) upd(best0[j], has0[j], score0[j], t_j, 0.0, inter);
+                    else upd(best1[j], has1[j], score1[j], t_j, 1.0, inter);
+                }
+            }
+
+            for (int i = 0; i < m; i++) {
+                if (!has0[i] && !has1[i]) continue;
+                cv::Point2d p1(result[i].line[0], result[i].line[1]);
+                cv::Point2d p2(result[i].line[2], result[i].line[3]);
+                if (has0[i]) p1 = best0[i].pt;
+                if (has1[i]) p2 = best1[i].pt;
+                double L = std::hypot(p2.x - p1.x, p2.y - p1.y);
+                if (L < 1.0) continue;
+                result[i].line = cv::Vec4d(p1.x, p1.y, p2.x, p2.y);
+                result[i].length_px = L;
+                result[i].angle_deg = line_angle_deg(result[i].line);
+            }
+        }
+    }
+
     return result;
 }

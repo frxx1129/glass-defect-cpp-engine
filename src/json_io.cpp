@@ -284,9 +284,22 @@ json result_to_json(const DetectionResult& result) {
 }
 
 // ---------- ROI 模板加载 ----------
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 std::vector<RoiRect> load_rois_from_file(const std::string& file_path) {
     std::vector<RoiRect> rois;
-    std::ifstream f(file_path);
+#ifdef _WIN32
+    // UTF-8 path -> UTF-16 open (Chinese path support)
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, file_path.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return rois;
+    std::wstring wpath(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, file_path.c_str(), -1, &wpath[0], wlen);
+    std::ifstream f(wpath, std::ios::binary);
+#else
+    std::ifstream f(file_path, std::ios::binary);
+#endif
     if (!f.is_open()) return rois;
     json j;
     try { f >> j; } catch (...) { return rois; }
