@@ -14,10 +14,10 @@ import tempfile
 class CppEngine:
     def __init__(self, exe_path=None):
         if exe_path is None:
-            # 默认路径：和脚本同目录的 ../build/Release/glass_engine.exe
+            # 默认路径：和脚本同目录的 ../build_new/glass_engine.exe（build.bat 产物）
             self.exe_path = os.path.join(
                 os.path.dirname(__file__),
-                "..", "build", "Release", "glass_engine.exe"
+                "..", "build_new", "glass_engine.exe"
             )
         else:
             self.exe_path = exe_path
@@ -25,7 +25,7 @@ class CppEngine:
         if not os.path.exists(self.exe_path):
             raise FileNotFoundError(
                 f"C++ engine not found at {self.exe_path}. "
-                f"Build it first: cd build && cmake .. && cmake --build . --config Release"
+                f"Build it first: 在项目根目录运行 build.bat（cl 直接编译，产物在 build_new\\glass_engine.exe）"
             )
 
     def detect(self, image_path, config=None, total_frames=0):
