@@ -20,6 +20,109 @@
 #endif
 #include <filesystem>
 
+namespace {
+
+// 缺陷标注绘制（镜像 Python _draw_defect_annotations，image_processor_hough.py:6013）。
+// defects 坐标为全图坐标（process_roi 已平移还原）；文本用 ASCII（cv::putText 不支持中文，
+// 中文标注需 FreeType 字体，暂以英文标签替代，格式与 Python 一致）。
+cv::Mat draw_defect_annotations(const cv::Mat& gray,
+                                const std::vector<Defect>& defects,
+                                const std::vector<RoiRect>& rois,
+                                double alpha) {
+    cv::Mat roi_bgr;
+    cv::cvtColor(gray, roi_bgr, cv::COLOR_GRAY2BGR);
+    const double beta = 1.0 - alpha;
+    const int THICKNESS = 1;
+
+    auto color_of = [](const std::string& type) -> cv::Scalar {
+        if (type == "Q" || type == "E") return cv::Scalar(0, 0, 255);      // 红
+        if (type == "X") return cv::Scalar(255, 0, 0);                     // 蓝
+        if (type == "L") return cv::Scalar(255, 0, 255);                   // 品红
+        if (type == "B") return cv::Scalar(0, 165, 255);                   // 橙
+        return cv::Scalar(255, 255, 255);
+    };
+
+    for (const auto& d : defects) {
+        const cv::Scalar color = color_of(d.type);
+
+        // Q：射线箭头
+        if (d.type == "Q" && !d.ray_segments.empty()) {
+            for (const auto& seg : d.ray_segments) {
+                cv::arrowedLine(roi_bgr, seg.first, seg.second, cv::Scalar(0, 255, 255), 1,
+                                cv::LINE_8, 0, 0.25);
+            }
+        }
+
+        if (d.type == "Q" && !d.region_contour.empty()) {
+            std::vector<std::vector<cv::Point>> poly{d.region_contour};
+            cv::Mat overlay = roi_bgr.clone();
+            cv::fillPoly(overlay, poly, color);
+            cv::addWeighted(overlay, alpha, roi_bgr, beta, 0, roi_bgr);
+            cv::drawContours(roi_bgr, poly, 0, color, THICKNESS);
+            if (!d.barrier_contour.empty()) {
+                cv::polylines(roi_bgr, d.barrier_contour, true, cv::Scalar(0, 255, 255), 1);
+            }
+        } else if (d.type == "X" && d.center.has_value()) {
+            cv::circle(roi_bgr, *d.center, 15, color, THICKNESS);
+        } else if ((d.type == "L" || d.type == "B" || d.type == "X" || d.type == "E") &&
+                   !d.box_points.empty()) {
+            std::vector<std::vector<cv::Point>> poly{d.box_points};
+            cv::Mat overlay = roi_bgr.clone();
+            cv::fillPoly(overlay, poly, color);
+            cv::addWeighted(overlay, alpha, roi_bgr, beta, 0, roi_bgr);
+            cv::drawContours(roi_bgr, poly, 0, color, THICKNESS);
+        }
+
+        // 文本标注（ROI 右上角，向下堆叠；镜像 Python 文本内容，英文标签）
+        char buf[160];
+        if (d.type == "E" || d.type == "X") {
+            const char* angle_kind = (d.subtype == "curved" || d.skew_subtype == "curved") ? "curv" : "ang";
+            std::snprintf(buf, sizeof(buf), "%s: (%d,%d), %s %.1f deg, size %.1fx%.1f mm",
+                          d.type.c_str(), d.x, d.y, angle_kind, d.angle_deg, d.length_mm, d.width_mm);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%s: (%d,%d), size %.1fx%.1f mm",
+                          d.type.c_str(), d.x, d.y, d.length_mm, d.width_mm);
+        }
+        const std::string text(buf);
+
+        int base_x = 0, base_y = 10, roi_w = (int)roi_bgr.cols;
+        if (d.roi_index >= 0 && d.roi_index < (int)rois.size()) {
+            base_x = rois[d.roi_index].x;
+            base_y = rois[d.roi_index].y + 10;
+            roi_w = rois[d.roi_index].width;   // 文本放在 ROI 右上角（镜像 Python）
+        }
+        int font = cv::FONT_HERSHEY_SIMPLEX;
+        double scale = 0.5;
+        int thickness = 1;
+        int baseline = 0;
+        cv::Size ts = cv::getTextSize(text, font, scale, thickness, &baseline);
+        int x_text = std::max(0, base_x + roi_w - ts.width - 10);
+        int y_text = base_y;
+        cv::putText(roi_bgr, text, cv::Point(x_text, y_text), font, scale, color, thickness, cv::LINE_AA);
+        (void)baseline;
+    }
+    return roi_bgr;
+}
+
+#ifdef _WIN32
+// UTF-8 路径安全保存（镜像 load_image 的 UTF-16 打开方式；cv::imwrite 不支持中文路径）
+bool save_image_utf8(const std::string& path, const cv::Mat& img) {
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return false;
+    std::wstring wpath(static_cast<size_t>(wlen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], wlen);
+    std::vector<uchar> buf;
+    if (!cv::imencode(".jpg", img, buf)) return false;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, wpath.c_str(), L"wb") != 0 || !fp) return false;
+    size_t written = fwrite(buf.data(), 1, buf.size(), fp);
+    fclose(fp);
+    return written == buf.size();
+}
+#endif
+
+} // namespace
+
 Detector::Detector(const EngineConfig& config) : config_(config) {
     px_per_mm_ = config_.px_per_mm > 0 ? config_.px_per_mm : 2.44;
     cam_key_ = config_.cam_key.empty() ? "cam0" : config_.cam_key;
@@ -451,5 +554,36 @@ DetectionResult Detector::detect(const cv::Mat& image_gray) {
 
 DetectionResult Detector::detect_file(const std::string& image_path) {
     cv::Mat gray = load_image(image_path);
-    return detect(gray);
+    DetectionResult result = detect(gray);
+
+    // 标注图输出（镜像 Python：静态抑制后对保留缺陷重绘）
+    if (config_.draw_defects && !config_.annotated_output_dir.empty()) {
+        try {
+            std::vector<RoiRect> rois = external_rois_;
+            if (rois.empty() && !config_.light.roi_template_file.empty()) {
+                rois = load_rois_from_file(config_.light.roi_template_file);
+            }
+            double alpha = config_.light.visualization.defect_overlay_alpha > 0
+                ? config_.light.visualization.defect_overlay_alpha : 0.25;
+            cv::Mat annotated = draw_defect_annotations(gray, result.defects, rois, alpha);
+
+            // 输出文件名：<原文件名去扩展名>_annotated.jpg
+            std::filesystem::path p(image_path);
+            std::string base = p.stem().string();
+            std::string out_path = config_.annotated_output_dir + "\\" + base + "_annotated.jpg";
+#ifdef _WIN32
+            if (!save_image_utf8(out_path, annotated)) {
+                std::cerr << "[WARN] annotated image save failed: " << out_path << std::endl;
+            }
+#else
+            if (!cv::imwrite(out_path, annotated)) {
+                std::cerr << "[WARN] annotated image save failed: " << out_path << std::endl;
+            }
+#endif
+            result.annotated_image_path = out_path;
+        } catch (const std::exception& e) {
+            std::cerr << "[WARN] draw_defects error: " << e.what() << std::endl;
+        }
+    }
+    return result;
 }
