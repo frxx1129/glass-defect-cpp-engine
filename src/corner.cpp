@@ -1,4 +1,4 @@
-﻿#include "engine/corner.h"
+#include "engine/corner.h"
 #include "engine/preprocess.h"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
@@ -49,6 +49,100 @@ double perp_dist(const cv::Point2d& pt, const cv::Vec4d& seg) {
     double len2 = dx * dx + dy * dy;
     if (len2 < 1e-9) return std::hypot(pt.x - seg[0], pt.y - seg[1]);
     return std::abs(dx * (seg[1] - pt.y) - dy * (seg[0] - pt.x)) / std::sqrt(len2);
+}
+
+// 平行四边形 + 边缘点集群验证（镜像 Python _q_parallelogram_cluster_ok，image_processor_hough.py:3832-3996）
+// 从 Q 三角形构造平行四边形，剔除主边射线条带后检查内部缺陷边缘连通域：
+// 存在 >= Q_PARALLELOGRAM_MIN_EDGE_PIXELS 像素且沿对角投影跨度 >= 25% 的连通域才保留该 Q。
+bool q_parallelogram_cluster_ok(const Defect& q, const cv::Mat& edges_img, const DefectDetectParams& dd) {
+    if (q.region_contour.size() != 3) return true;   // 无法验证则放行
+    if (edges_img.empty()) return true;
+    const int H = edges_img.rows, W = edges_img.cols;
+
+    cv::Point2d A(q.region_contour[0].x, q.region_contour[0].y);
+    cv::Point2d B(q.region_contour[1].x, q.region_contour[1].y);
+    cv::Point2d C(q.region_contour[2].x, q.region_contour[2].y);
+    cv::Point2d P, Q, R;
+    double dAB = cv::norm(A - B), dBC = cv::norm(B - C), dCA = cv::norm(C - A);
+    if (dAB >= dBC && dAB >= dCA) { P = A; Q = B; R = C; }
+    else if (dBC >= dAB && dBC >= dCA) { P = B; Q = C; R = A; }
+    else { P = C; Q = A; R = B; }
+
+    cv::Point2d M = (P + Q) * 0.5;
+    cv::Point2d D = 2.0 * M - R;
+    std::vector<cv::Point2d> quad = {P, Q, R, D};
+    cv::Point2d cen(0, 0);
+    for (auto& p : quad) { cen.x += p.x; cen.y += p.y; }
+    cen.x /= 4.0; cen.y /= 4.0;
+    std::sort(quad.begin(), quad.end(), [&](const cv::Point2d& a, const cv::Point2d& b) {
+        return std::atan2(a.y - cen.y, a.x - cen.x) < std::atan2(b.y - cen.y, b.x - cen.x);
+    });
+    std::vector<cv::Point> contour;
+    for (auto& p : quad) contour.push_back(cv::Point((int)std::lround(p.x), (int)std::lround(p.y)));
+    std::vector<std::vector<cv::Point>> polys{contour};
+
+    cv::Mat mask = cv::Mat::zeros(H, W, CV_8U);
+    cv::fillPoly(mask, polys, cv::Scalar(255));
+    cv::Mat inner;
+    cv::erode(mask, inner, cv::Mat::ones(3, 3, CV_8U), cv::Point(-1, -1), 1);
+
+    // 剔除沿主边（射线）延长方向的条带，避免边界噪声干扰
+    int stripe_half = std::max(0, dd.q_parallelogram_exclude_stripe_half_px);
+    if (stripe_half > 0 && !q.ray_segments.empty()) {
+        cv::Mat exclude = cv::Mat::zeros(H, W, CV_8U);
+        double L = 2.0 * std::max(H, W);
+        int thick = 2 * stripe_half + 1;
+        int nrays = std::min(2, (int)q.ray_segments.size());
+        for (int k = 0; k < nrays; k++) {
+            cv::Point2d p1(q.ray_segments[k].first.x, q.ray_segments[k].first.y);
+            cv::Point2d p2(q.ray_segments[k].second.x, q.ray_segments[k].second.y);
+            cv::Point2d v = p2 - p1;
+            double nrm = cv::norm(v);
+            if (nrm < 1e-3) continue;
+            cv::Point2d u(v.x / nrm, v.y / nrm);
+            cv::Point2d mid = (p1 + p2) * 0.5;
+            cv::Point2d s = mid - u * L;
+            cv::Point2d e = mid + u * L;
+            cv::line(exclude,
+                     cv::Point((int)std::lround(s.x), (int)std::lround(s.y)),
+                     cv::Point((int)std::lround(e.x), (int)std::lround(e.y)),
+                     cv::Scalar(255), thick, cv::LINE_AA);
+        }
+        inner.setTo(0, exclude);   // inner &= ~exclude
+    }
+
+    cv::Mat cand;
+    cv::bitwise_and(edges_img, edges_img, cand, inner);
+    cv::dilate(cand, cand, cv::Mat::ones(3, 3, CV_8U), cv::Point(-1, -1), 1);
+
+    cv::Mat labels, stats, centroids;
+    int num_labels = cv::connectedComponentsWithStats(cand, labels, stats, centroids, 8, CV_32S);
+    if (num_labels <= 1) return false;
+
+    const int min_pixels = 50;              // Q_PARALLELOGRAM_MIN_EDGE_PIXELS
+    const double span_frac = 0.25;          // Q_PARALLELOGRAM_MIN_SPAN_FRAC
+    cv::Point2d diag = Q - P;
+    double diag_len = cv::norm(diag);
+    if (diag_len <= 1.0) return false;
+    cv::Point2d u(diag.x / diag_len, diag.y / diag_len);
+    double need_span = span_frac * diag_len;
+    for (int lbl = 1; lbl < num_labels; lbl++) {
+        int cnt = stats.at<int>(lbl, cv::CC_STAT_AREA);
+        if (cnt < min_pixels) continue;
+        double min_proj = 1e18, max_proj = -1e18;
+        for (int yy = 0; yy < H; yy++) {
+            const int* row = labels.ptr<int>(yy);
+            for (int xx = 0; xx < W; xx++) {
+                if (row[xx] == lbl) {
+                    double proj = (xx - P.x) * u.x + (yy - P.y) * u.y;
+                    min_proj = std::min(min_proj, proj);
+                    max_proj = std::max(max_proj, proj);
+                }
+            }
+        }
+        if (min_proj <= max_proj && (max_proj - min_proj) >= need_span) return true;
+    }
+    return false;
 }
 
 // 主体聚类：近竖直边 x 中点间隙二分
@@ -427,6 +521,9 @@ std::vector<Defect> detect_q_defects(
         }
         if (!picked) dedup.push_back(qc);
     }
-    for (auto& qc : dedup) q_defects.push_back(qc.d);
+    for (auto& qc : dedup) {
+        // 平行四边形 + 边缘点集群验证（镜像 Python）：内部无足够缺陷边缘的 Q 视为误报
+        if (q_parallelogram_cluster_ok(qc.d, binary_edges, dd)) q_defects.push_back(qc.d);
+    }
     return q_defects;
 }

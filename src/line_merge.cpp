@@ -463,22 +463,26 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
             ml.line = final_line;
             ml.angle_deg = line_angle_deg(final_line);
             ml.length_px = std::hypot(final_line[2] - final_line[0], final_line[3] - final_line[1]);
-            ml.support = (int)pts.size();
+            // support = 组内原始线段长度之和（镜像 Python score = sum(norm(l[2:4]-l[0:2]) for l in group)），
+            // 用于排序与 ENSURE_VERTICAL_PER_CLUSTER 强度比较；不是点数。
+            double support_score = 0.0;
+            for (auto& ln : group) support_score += line_length_px(ln);
+            ml.support = (int)std::lround(support_score);
             ml.near_vertical = is_near_vertical(ml.angle_deg, v_tol);
             ml.near_horizontal = is_near_horizontal(ml.angle_deg, h_tol);
 #ifdef CPP_DEBUG_MERGED
             std::cerr << "  [FIT] (" << final_line[0] << "," << final_line[1] << ")->("
                       << final_line[2] << "," << final_line[3] << ") ang=" << ml.angle_deg
-                      << " len=" << ml.length_px << " npts=" << pts.size() << std::endl;
+                      << " len=" << ml.length_px << " support=" << ml.support << " npts=" << pts.size() << std::endl;
 #endif
             result.push_back(ml);
         }
     }
 
-    // 按长度排序取 top_n
+    // 按 support（=组内长度之和，镜像 Python score）排序取 top_n
     std::vector<MergedLine> all_lines = result; // topN 前全部候选（镜像 Python filtered）
     std::sort(result.begin(), result.end(),
-              [](const MergedLine& a, const MergedLine& b) { return a.length_px > b.length_px; });
+              [](const MergedLine& a, const MergedLine& b) { return a.support > b.support; });
     if ((int)result.size() > p.top_n_edges) result.resize(p.top_n_edges);
 
     // ===== 多玻璃/多主体：每个 cluster 至少保留一条近竖直主边（镜像 Python ENSURE_VERTICAL_PER_CLUSTER，1961-2055）=====
@@ -509,7 +513,7 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                     edges_cluster[i] = cluster_id(result[i]);
                     if (result[i].near_vertical) has_v[edges_cluster[i]] = true;
                 }
-                // 候选集（all_lines）中每个 cluster 的最强竖直候选（不在 top_n 内）
+                // 候选集（all_lines）中每个 cluster 的最强竖直候选（不在 top_n 内；按 support=score 比较）
                 MergedLine* best_v[2] = {nullptr, nullptr};
                 for (auto& ml : all_lines) {
                     if (!ml.near_vertical) continue;
@@ -519,7 +523,7 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                         if (result[i].line == ml.line) in_edges = true;
                     }
                     if (in_edges) continue;
-                    if (!best_v[cid] || ml.length_px > best_v[cid]->length_px) best_v[cid] = &ml;
+                    if (!best_v[cid] || ml.support > best_v[cid]->support) best_v[cid] = &ml;
                 }
                 for (int cid = 0; cid < 2; cid++) {
                     if (has_v[cid] || !best_v[cid]) continue;
@@ -535,7 +539,7 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                     if (!cand_idxs.empty()) {
                         int idx_min = cand_idxs[0];
                         for (int i : cand_idxs)
-                            if (result[i].length_px < result[idx_min].length_px) idx_min = i;
+                            if (result[i].support < result[idx_min].support) idx_min = i;
                         result[idx_min] = *best_v[cid];
                     }
                 }

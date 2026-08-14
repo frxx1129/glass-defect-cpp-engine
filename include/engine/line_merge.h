@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "engine/config.h"
 #include <vector>
 #include <opencv2/core.hpp>
@@ -6,9 +6,9 @@
 // 合并后的直线（镜像 Python merge_lines_and_get_main_edges 输出）
 struct MergedLine {
     cv::Vec4d line;          // 合并后直线 (x1,y1,x2,y2)
-    double angle_deg = 0.0;  // 0°=水平, 90°=竖直
+    double angle_deg = 0.0;  // 0°=水平, 90°=竖直（[0,180) 真实角度）
     double length_px = 0.0;
-    int support = 0;         // 支撑点数量（group 内线段端点数）
+    int support = 0;         // 镜像 Python score：组内原始线段长度之和（用于 topN 排序/强度比较）
     bool near_vertical = false;
     bool near_horizontal = false;
 };

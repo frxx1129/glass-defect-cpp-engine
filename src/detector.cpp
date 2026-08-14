@@ -563,8 +563,9 @@ DetectionResult Detector::detect_file(const std::string& image_path) {
             if (rois.empty() && !config_.light.roi_template_file.empty()) {
                 rois = load_rois_from_file(config_.light.roi_template_file);
             }
-            double alpha = config_.light.visualization.defect_overlay_alpha > 0
-                ? config_.light.visualization.defect_overlay_alpha : 0.25;
+            double alpha = (config_.mode == "dark" ? config_.dark : config_.light)
+                               .visualization.defect_overlay_alpha;
+            if (alpha <= 0) alpha = 0.25;
             cv::Mat annotated = draw_defect_annotations(gray, result.defects, rois, alpha);
 
             // 输出文件名：<原文件名去扩展名>_annotated.jpg
