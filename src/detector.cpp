@@ -82,6 +82,13 @@ std::vector<Defect> Detector::process_roi(
     // Hough 直线（镜像 Python：先按 DOWNSAMPLE_SCALE 降采样再放大回原图）
     std::vector<cv::Vec4i> lines;
     {
+        // 镜像 Python round()/np.round()：银行家舍入（.5 时取偶数），避免 0.5 边界 1px 差异
+        auto round_banker = [](double x) -> int {
+            double r = std::floor(x);
+            double frac = x - r;
+            if (frac > 0.5 || (frac == 0.5 && std::fmod(r, 2.0) != 0.0)) r += 1.0;
+            return (int)r;
+        };
         // 最小线段长度：镜像 Python MIN_LINE_LENGTH_MODE="min"（min(ROI宽,高) x 比例，不设下限）
         double min_len = params.hough.min_line_length;
         if (params.hough.min_line_length_ratio > 0) {
@@ -92,18 +99,18 @@ std::vector<Defect> Detector::process_roi(
         double ds_scale = 0.85;
         if (ds_scale < 0.999) {
             int w_full = edges.cols, h_full = edges.rows;
-            int w_small = std::max(1, (int)std::lround(w_full * ds_scale));
-            int h_small = std::max(1, (int)std::lround(h_full * ds_scale));
+            int w_small = std::max(1, round_banker(w_full * ds_scale));
+            int h_small = std::max(1, round_banker(h_full * ds_scale));
             cv::Mat edges_small;
             cv::resize(edges, edges_small, cv::Size(w_small, h_small), 0, 0, cv::INTER_AREA);
             double scale_x = (double)w_full / w_small;
             double scale_y = (double)h_full / h_small;
             double scale_len = std::min(1.0, std::min(w_small / (double)std::max(1, w_full),
                                                       h_small / (double)std::max(1, h_full)));
-            int min_len_small = std::max(1, (int)std::lround(min_len * scale_len));
+            int min_len_small = std::max(1, round_banker(min_len * scale_len));
             double max_gap_full = params.hough.max_line_gap_mm > 0
                 ? params.hough.max_line_gap_mm * px_per_mm_ : params.hough.max_line_gap;
-            int max_gap_small = std::max(0, (int)std::lround(max_gap_full * scale_len));
+            int max_gap_small = std::max(0, round_banker(max_gap_full * scale_len));
             std::vector<cv::Vec4i> raw_small;
             cv::HoughLinesP(edges_small, raw_small,
                             params.hough.rho,
@@ -111,28 +118,38 @@ std::vector<Defect> Detector::process_roi(
                             params.hough.threshold,
                             min_len_small,
                             max_gap_small);
-            // 坐标放大回原图
+            // 坐标放大回原图（银行家舍入，镜像 Python np.round().astype(int32)）
             for (auto& l : raw_small) {
-                l[0] = (int)std::lround(l[0] * scale_x);
-                l[1] = (int)std::lround(l[1] * scale_y);
-                l[2] = (int)std::lround(l[2] * scale_x);
-                l[3] = (int)std::lround(l[3] * scale_y);
+                l[0] = round_banker(l[0] * scale_x);
+                l[1] = round_banker(l[1] * scale_y);
+                l[2] = round_banker(l[2] * scale_x);
+                l[3] = round_banker(l[3] * scale_y);
             }
             lines = raw_small;
         } else {
             double max_gap_full = params.hough.max_line_gap_mm > 0
                 ? params.hough.max_line_gap_mm * px_per_mm_ : params.hough.max_line_gap;
+            int min_len_i = std::max(1, round_banker(min_len));
+            int max_gap_i = std::max(0, round_banker(max_gap_full));
             cv::HoughLinesP(edges, lines,
                             params.hough.rho,
                             params.hough.theta_deg * CV_PI / 180.0,
                             params.hough.threshold,
-                            min_len,
-                            max_gap_full);
+                            min_len_i,
+                            max_gap_i);
         }
     }
 
     // 直线合并
     auto merged = merge_lines_and_get_main_edges(lines, params, px_per_mm_, edges);
+
+#ifdef CPP_DEBUG_RAW
+    std::cerr << "[RAW] roi=" << roi_idx << " n=" << lines.size() << std::endl;
+    for (auto& l : lines) {
+        std::cerr << "  (" << l[0] << "," << l[1] << ")->(" << l[2] << "," << l[3]
+                  << ") len=" << std::hypot(l[2]-l[0], l[3]-l[1]) << std::endl;
+    }
+#endif
 
 #ifdef CPP_DEBUG_MERGED
     for (auto& ml : merged) {
@@ -323,7 +340,10 @@ std::vector<Defect> Detector::process_roi(
                 if (long_ang > 90.0) long_ang = 180.0 - long_ang;
                 bool is_perp = false;
                 for (auto& ml : merged) {
-                    double ang_diff = std::abs(ml.angle_deg - long_ang);
+                    // ml.angle_deg 为 [0,180) 真实角度，先折叠到 [0,90] 再比较
+                    double mla = std::fmod(std::abs(ml.angle_deg), 180.0);
+                    if (mla > 90.0) mla = 180.0 - mla;
+                    double ang_diff = std::abs(mla - long_ang);
                     ang_diff = std::min(ang_diff, 180.0 - ang_diff);
                     if (ang_diff >= (90.0 - perp_tol)) { is_perp = true; break; }
                 }

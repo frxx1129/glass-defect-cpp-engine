@@ -111,7 +111,8 @@ std::vector<Defect> detect_e_defects(
     if (suppress_w_eff > 0 && !true_edges.empty()) {
         mask_lines = cv::Mat::zeros(edges_base.size(), CV_8U);
         for (auto& ml : true_edges) {
-            double ang = ml.angle_deg;
+            // 折叠到 [0,90]（镜像 Python：ang = abs(atan2); if ang>90: ang=180-ang）
+            double ang = angle_abs_deg(ml.angle_deg);
             if (ang >= (90.0 - v_tol) || ang <= h_tol) {
                 cv::Vec4d clipped = clip_line_to_roi(ml.line, w_img, h_img);
                 cv::line(mask_lines,
@@ -173,7 +174,8 @@ std::vector<Defect> detect_e_defects(
     if (dd.e_include_skew_main_edges && !true_edges.empty()) {
         double min_len_px_for_main = dd.e_from_main_edge_min_len_mm * px_per_mm;
         for (auto& ml : true_edges) {
-            double ang = ml.angle_deg;
+            // 折叠到 [0,90]（镜像 Python：ang = abs(atan2); if ang>90: ang=180-ang）
+            double ang = angle_abs_deg(ml.angle_deg);
 
             if (ang <= h_tol || ang >= (90.0 - v_tol)) continue;
             if (ml.length_px < min_len_px_for_main) continue;

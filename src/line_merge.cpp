@@ -1,7 +1,8 @@
-﻿#include "engine/line_merge.h"
+#include "engine/line_merge.h"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <numeric>
 
 double line_length_px(const cv::Vec4i& l) {
@@ -10,12 +11,17 @@ double line_length_px(const cv::Vec4i& l) {
 }
 double line_angle_deg(const cv::Vec4i& l) {
     double dx = l[2] - l[0], dy = l[3] - l[1];
-    double a = std::atan2(std::abs(dy), dx) * 180.0 / CV_PI;
+    // 镜像 Python：atan2(dy,dx) 负值 +180，归一化到 [0,180)。
+    // 不能用 atan2(|dy|,dx)：会抹掉 dy 符号，导致向下倾斜与向上倾斜的线被折叠到同一角度，
+    // 使角度簇合并错误（如 178.99° 与 4.19° 的真实夹角 5.2° 被误算成 3.18°）。
+    double a = std::atan2(dy, dx) * 180.0 / CV_PI;
+    if (a < 0) a += 180.0;
     return a;
 }
 double line_angle_deg(const cv::Vec4d& l) {
     double dx = l[2] - l[0], dy = l[3] - l[1];
-    double a = std::atan2(std::abs(dy), dx) * 180.0 / CV_PI;
+    double a = std::atan2(dy, dx) * 180.0 / CV_PI;
+    if (a < 0) a += 180.0;
     return a;
 }
 
@@ -210,6 +216,16 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
         std::sort(segments.begin(), segments.end(),
                   [](const cv::Vec4i& a, const cv::Vec4i& b) { return line_length_px(a) > line_length_px(b); });
 
+#ifdef CPP_DEBUG_MERGED
+        {
+            std::cerr << "[CLUSTER] ang=" << angle << " n=" << segments.size() << std::endl;
+            for (auto& s : segments) {
+                std::cerr << "  seg (" << s[0] << "," << s[1] << ")->(" << s[2] << "," << s[3]
+                          << ") len=" << line_length_px(s) << std::endl;
+            }
+        }
+#endif
+
         std::vector<std::vector<cv::Vec4i>> proximity_groups;
         proximity_groups.push_back({segments[0]});
         for (size_t si = 1; si < segments.size(); si++) {
@@ -250,6 +266,19 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
             }
             if (!placed) proximity_groups.push_back({seg});
         }
+
+#ifdef CPP_DEBUG_MERGED
+        {
+            std::cerr << "  [PROX] ang=" << angle << " groups=" << proximity_groups.size() << std::endl;
+            for (size_t gi = 0; gi < proximity_groups.size(); gi++) {
+                std::cerr << "    group" << gi << ":";
+                for (auto& s : proximity_groups[gi]) {
+                    std::cerr << " (" << s[0] << "," << s[1] << ")->(" << s[2] << "," << s[3] << ")";
+                }
+                std::cerr << std::endl;
+            }
+        }
+#endif
 
         // ===== 竖直粗边二次合并（MAD 厚度 + 动态横向阈值 + 重叠比例）=====
         bool is_vert = is_near_vertical(angle, v_tol);
@@ -437,14 +466,82 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
             ml.support = (int)pts.size();
             ml.near_vertical = is_near_vertical(ml.angle_deg, v_tol);
             ml.near_horizontal = is_near_horizontal(ml.angle_deg, h_tol);
+#ifdef CPP_DEBUG_MERGED
+            std::cerr << "  [FIT] (" << final_line[0] << "," << final_line[1] << ")->("
+                      << final_line[2] << "," << final_line[3] << ") ang=" << ml.angle_deg
+                      << " len=" << ml.length_px << " npts=" << pts.size() << std::endl;
+#endif
             result.push_back(ml);
         }
     }
 
     // 按长度排序取 top_n
+    std::vector<MergedLine> all_lines = result; // topN 前全部候选（镜像 Python filtered）
     std::sort(result.begin(), result.end(),
               [](const MergedLine& a, const MergedLine& b) { return a.length_px > b.length_px; });
     if ((int)result.size() > p.top_n_edges) result.resize(p.top_n_edges);
+
+    // ===== 多玻璃/多主体：每个 cluster 至少保留一条近竖直主边（镜像 Python ENSURE_VERTICAL_PER_CLUSTER，1961-2055）=====
+    // 当全部候选按 x 中点存在大间隙（>= GLASS_CLUSTER_GAP_MM）时划分左右两 cluster；
+    // 若某 cluster 的 top_n 内没有竖直主边，则用该 cluster 候选集中最强的竖直边替换其最弱的非竖直边。
+    // 典型场景：多玻璃 ROI 中右侧玻璃只有斜边噪声进入 top_n，缺少竖直主边 → E 误报。
+    if (p.ensure_vertical_per_cluster && !all_lines.empty() && !result.empty()) {
+        double cluster_gap_px = 40.0 * px_per_mm; // GLASS_CLUSTER_GAP_MM 默认 40
+        if (cluster_gap_px > 0 && (int)all_lines.size() >= 4) {
+            std::vector<double> mids;
+            for (auto& ml : all_lines) mids.push_back((ml.line[0] + ml.line[2]) * 0.5);
+            std::sort(mids.begin(), mids.end());
+            double max_gap = 0.0; int k = -1;
+            for (size_t i = 0; i + 1 < mids.size(); i++) {
+                double g = mids[i + 1] - mids[i];
+                if (g > max_gap) { max_gap = g; k = (int)i; }
+            }
+            if (k >= 0 && max_gap >= cluster_gap_px) {
+                double x_thresh = 0.5 * (mids[k] + mids[k + 1]);
+                auto cluster_id = [x_thresh](const MergedLine& ml) -> int {
+                    double mx = (ml.line[0] + ml.line[2]) * 0.5;
+                    return mx <= x_thresh ? 0 : 1;
+                };
+                int m = (int)result.size();
+                std::vector<int> edges_cluster(m);
+                bool has_v[2] = {false, false};
+                for (int i = 0; i < m; i++) {
+                    edges_cluster[i] = cluster_id(result[i]);
+                    if (result[i].near_vertical) has_v[edges_cluster[i]] = true;
+                }
+                // 候选集（all_lines）中每个 cluster 的最强竖直候选（不在 top_n 内）
+                MergedLine* best_v[2] = {nullptr, nullptr};
+                for (auto& ml : all_lines) {
+                    if (!ml.near_vertical) continue;
+                    int cid = cluster_id(ml);
+                    bool in_edges = false;
+                    for (int i = 0; i < m && !in_edges; i++) {
+                        if (result[i].line == ml.line) in_edges = true;
+                    }
+                    if (in_edges) continue;
+                    if (!best_v[cid] || ml.length_px > best_v[cid]->length_px) best_v[cid] = &ml;
+                }
+                for (int cid = 0; cid < 2; cid++) {
+                    if (has_v[cid] || !best_v[cid]) continue;
+                    // 优先替换该 cluster 内最弱的非竖直边；否则该 cluster 内最弱边；再否则全局最弱边
+                    std::vector<int> cand_idxs;
+                    for (int i = 0; i < m; i++)
+                        if (edges_cluster[i] == cid && !result[i].near_vertical) cand_idxs.push_back(i);
+                    if (cand_idxs.empty())
+                        for (int i = 0; i < m; i++)
+                            if (edges_cluster[i] == cid) cand_idxs.push_back(i);
+                    if (cand_idxs.empty())
+                        for (int i = 0; i < m; i++) cand_idxs.push_back(i);
+                    if (!cand_idxs.empty()) {
+                        int idx_min = cand_idxs[0];
+                        for (int i : cand_idxs)
+                            if (result[i].length_px < result[idx_min].length_px) idx_min = i;
+                        result[idx_min] = *best_v[cid];
+                    }
+                }
+            }
+        }
+    }
 
     // ===== 交点裁剪/延长（镜像 Python merge 的端点交点对齐，2060-2231）=====
     // 把线段端点延长/裁剪到与其他线段的交点，使斜边端点对齐到水平/竖直边交点。
