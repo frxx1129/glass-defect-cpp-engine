@@ -347,6 +347,7 @@ DetectionRequest parse_request(const std::string& json_str) {
     req.config.cam_key = j.value("cam_key", req.config.cam_key);
     req.config.static_artifact_enabled = j.value("static_artifact_enabled", req.config.static_artifact_enabled);
     req.config.draw_defects = j.value("draw_defects", req.config.draw_defects);
+    req.config.mode = j.value("mode", req.config.mode);
     // 顶层键存在才覆盖（否则保留 config 内的 annotated_output_dir，避免误清空）
     if (j.contains("annotated_output_dir")) {
         req.config.annotated_output_dir = j.value("annotated_output_dir", "");

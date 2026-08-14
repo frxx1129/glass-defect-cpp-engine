@@ -517,8 +517,8 @@ DetectionResult Detector::detect(const cv::Mat& image_gray) {
     DetectionResult result;
     auto start = cv::getTickCount();
 
-    // 选择参数（明场默认；暗场由请求注入 mode）
-    const InspectorParams* params = &config_.light;
+    // 选择参数（明场默认；暗场由请求注入 mode="dark"）
+    const InspectorParams* params = (config_.mode == "dark") ? &config_.dark : &config_.light;
 
     // 加载 ROI
     std::vector<RoiRect> rois = external_rois_;

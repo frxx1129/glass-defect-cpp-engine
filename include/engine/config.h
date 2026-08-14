@@ -204,6 +204,7 @@ struct EngineConfig {
     int total_frames = 0;
     std::string cam_key = "cam0";       // 静态抑制按相机区分状态
     bool static_artifact_enabled = true;
+    std::string mode = "light";         // "light"=hough_inspector_params（明场，生产） / "dark"=hough_inspector_dark_params（暗场）
 
     // 输出标注图开关/路径
     bool draw_defects = true;
