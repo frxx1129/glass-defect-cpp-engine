@@ -167,9 +167,22 @@ static DefectDetectParams parse_defect_detection(const json& dd) {
     d.corner_max_physical_gap_mm = get_d(dd, "CORNER_MAX_PHYSICAL_GAP_MM", 5.0);
     d.corner_max_physical_gap = get_i(dd, "CORNER_MAX_PHYSICAL_GAP", 7);
     d.corner_min_virtual_gap = get_d(dd, "CORNER_MIN_VIRTUAL_GAP", 7.0);
-    d.corner_max_extension_normal_mm = get_d(dd, "CORNER_MAX_EXTENSION_DIST_NORMAL_MM", 0.0);
-    d.corner_max_extension_perp_mm = get_d(dd, "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR_MM", 45.0);
-    d.corner_max_extension_perp = get_i(dd, "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR", 200);
+    if (dd.contains("CORNER_MAX_EXTENSION_DIST_NORMAL_MM")) {
+        d.corner_max_extension_normal_mm = get_d(dd, "CORNER_MAX_EXTENSION_DIST_NORMAL_MM", 0.0);
+        d.has_corner_max_extension_normal_mm = true;
+    }
+    if (dd.contains("CORNER_MAX_EXTENSION_DIST_NORMAL")) {
+        d.corner_max_extension_normal = get_i(dd, "CORNER_MAX_EXTENSION_DIST_NORMAL", 0);
+        d.has_corner_max_extension_normal = true;
+    }
+    if (dd.contains("CORNER_MAX_EXTENSION_DIST_PERPENDICULAR_MM")) {
+        d.corner_max_extension_perp_mm = get_d(dd, "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR_MM", 45.0);
+        d.has_corner_max_extension_perp_mm = true;
+    }
+    if (dd.contains("CORNER_MAX_EXTENSION_DIST_PERPENDICULAR")) {
+        d.corner_max_extension_perp = get_i(dd, "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR", 200);
+        d.has_corner_max_extension_perp = true;
+    }
     d.perpendicular_angle_tolerance = get_d(dd, "PERPENDICULAR_ANGLE_TOLERANCE", 10.0);
     d.vertical_angle_tol_deg = get_d(dd, "VERTICAL_ANGLE_TOL_DEG", 10.0);
     // 0 = 键未设置；代码按 Python 各调用点默认处理

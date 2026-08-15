@@ -256,12 +256,17 @@ int quadrant_compatibility(const cv::Vec4d& l1, const cv::Vec4d& l2, int w, int 
 double max_extension_px(const DefectDetectParams& dd, double angle_between, double px_per_mm) {
     bool perp = std::abs(angle_between - 90.0) < dd.perpendicular_angle_tolerance;
     if (perp) {
-        if (dd.corner_max_extension_perp_mm > 0.0)
+        // Python _get_dist_px：mm 键存在优先（即使值为 0），否则 px 键，再否则 0
+        if (dd.has_corner_max_extension_perp_mm)
             return dd.corner_max_extension_perp_mm * px_per_mm;
-        return (double)dd.corner_max_extension_perp;
+        if (dd.has_corner_max_extension_perp)
+            return (double)dd.corner_max_extension_perp;
+        return 0.0;
     }
-    if (dd.corner_max_extension_normal_mm > 0.0)
+    if (dd.has_corner_max_extension_normal_mm)
         return dd.corner_max_extension_normal_mm * px_per_mm;
+    if (dd.has_corner_max_extension_normal)
+        return (double)dd.corner_max_extension_normal;
     return 0.0;
 }
 

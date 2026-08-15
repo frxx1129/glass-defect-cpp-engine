@@ -177,8 +177,14 @@ struct DefectDetectParams {
     int corner_max_physical_gap = 7;
     double corner_min_virtual_gap = 7.0;
     double corner_max_extension_normal_mm = 0.0;
+    int corner_max_extension_normal = 0;
     double corner_max_extension_perp_mm = 45.0;
     int corner_max_extension_perp = 200;
+    // Python _get_dist_px 在“键不存在”时返回 0；这些标志用于区分“未设置”和“显式 0”
+    bool has_corner_max_extension_normal_mm = false;
+    bool has_corner_max_extension_normal = false;
+    bool has_corner_max_extension_perp_mm = false;
+    bool has_corner_max_extension_perp = false;
     double perpendicular_angle_tolerance = 10.0;
     // Python VERTICAL_ANGLE_TOL_DEG 默认 10（生产 config=15）
     double vertical_angle_tol_deg = 10.0;
