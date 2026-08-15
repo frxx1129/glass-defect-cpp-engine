@@ -23,7 +23,7 @@ Python 引擎仓库（`glass-defect-algo`）采用 PolyForm Noncommercial Licens
 
 - `src/main.cpp`：可执行入口，支持单图 / stdin JSON / 批量三种模式。
 - `src/detector.cpp`：ROI 检测主流程（镜像 Python `process_roi_hough_based`），含 Hough、直线合并、缺陷分类与标注图输出。
-- `src/line_merge.cpp`：直线合并（角度聚类、邻近聚类、fitLine、轴向锁定、交点裁剪、ENSURE_VERTICAL_PER_CLUSTER）。
+- `src/line_merge.cpp`：直线合并（角度聚类、邻近聚类、fitLine、轴向锁定 + Canny 拟合（HORIZONTAL_LOCK_FIT）、Canny snap 细调、交点裁剪、ENSURE_VERTICAL_PER_CLUSTER）。
 - `src/skew.cpp`：E 型边缘异常检测。
 - `src/corner.cpp`：Q 缺角检测（含平行四边形验证过滤）。
 - `src/luminosity.cpp`：B 崩边亮度扫描。
@@ -90,30 +90,36 @@ glass_engine --batch < input.jsonl
 
 ## 验证
 
-对比工具 `scripts/batch_compare.py` 对同一图片分别运行 Python 与 C++，比对缺陷数量与类型@位置。以下结果为本仓库开发期间实测（2026-08）：
+对比工具 `scripts/batch_compare.py` 对同一图片分别运行 Python 与 C++，比对缺陷数量与类型@位置（数量不一致即 DIFF）。以下结果为本仓库开发期间实测（2026-08，对照修复后的本地 Python 参考，见下文“与 Python 引擎的关系”）：
 
-| 数据集 | ROI 模板 | 结果 |
-|--------|---------|------|
-| cam1（bugs 27 + cam1 部分，80 图） | `cam1_roi_averaged_by_group.json` | 80/80 全一致 |
-| line3 original（130 图） | `roi_averaged_by_group_CORRECTED.json` | 129/130 一致 |
+| 数据集 | 配置 | ROI 模板 | 结果 |
+|--------|------|---------|------|
+| line3 original（139 图，含 cam-1/cam2/cam3/cam4 混入） | `config.yaml`（Line3） | `cam1_roi_averaged_by_group.json` | 139/139 全一致 |
+| cam1（77 图） | `config.yaml`（Line3） | `cam1_roi_averaged_by_group.json` | 77/77 全一致 |
+| line2 0119 original（45 图） | `config2.yaml`（Line2） | `roi_averaged_by_group_CORRECTED.json` | 45/45 全一致 |
+| bugs（27 图，含 cam3 混入） | `config.yaml`（Line3） | `cam1_roi_averaged_by_group.json` | 27/27 全一致 |
 
-line3 剩余 1 张为 cam2 数据混入（cam2 图使用 cam1 ROI 验证）：C++ 已报出与 Python 匹配的缺陷，多出 1 个 E 源于 Canny snap 尚未镜像，需 cam2 ROI 模板单独验证。
+合计 **288 张，DIFF=0**。批量对比时工具会对每张图深拷贝配置并重置 Python 全局缓存（`reset_global_caches`），避免 Python 参考的跨帧稳定器（栅栏/玻璃边界/理想竖直缓存）在 ROI_ID 未设置时跨图串扰导致结果不稳定。
 
-待验证：line2、cam5、暗场模式（需对应 ROI 模板与测试数据，以现场机器为准）。
+待验证：cam5、暗场模式（需对应 ROI 模板与测试数据，以现场机器为准）。
 
 调试编译宏：
 
 | 宏 | 输出 |
 |----|------|
-| `-DCPP_DEBUG_MERGED` | merge 分组/结果（[CLUSTER] / [PROX] / [FIT]） |
+| `-DCPP_DEBUG_MERGED` | merge 分组/结果（[CLUSTER] / [PROX] / [FIT] / [SNAP]） |
 | `-DCPP_DEBUG_RAW` | Hough 原始线段 |
 | `-DCPP_DEBUG_E` | E 检测中间结果 |
+| `-DCPP_DEBUG_B` | B 亮度扫描中间结果 |
+| `-DCPP_DEBUG_Q` | Q 角点/射线中间结果（[Q-CORNER] 等） |
 
 ## 与 Python 引擎的关系
 
 - Python 引擎（`image_processor_hough.py`，约 6700 行）是生产参考实现；C++ 引擎逐模块镜像其算法与阈值。
+- **Python 参考侧修复（仅本地验证基准，未改动 GitHub fork）**：`find_and_analyze_defects` 的 Q 检测（corner_contour 块）存在两处未定义名称（`_q_enabled_runtime`、`_angle_to_x_axis_deg`），被外层 `except: pass` 吞掉后 Q 检测从未真正执行（上游 zay002 原版与 fork 均如此）。本地验证基准补上这两处定义后，Python 才按算法意图输出 Q，C++ 的 Q 引擎与之逐图对齐。
+- C++ 侧对齐项（均镜像 Python 语义，非调阈值）：亮度扫描掩膜取整（np.int32 截断）、E 重叠合并含端点宽度、E_FROM_MAIN 近水平容差（HORIZONTAL_ANGLE_TOL_DEG=10，与轮廓路径的 v_tol=15 分离）、水平轴向锁定 Canny 拟合（HORIZONTAL_LOCK_FIT_*）、Q 主体聚类 X/Y 回退二分、射线求交 u 符号、角点 (竖直,水平) 顺序、三角形顶点取整、平行四边形条带剔除（保留抗锯齿像素）、射线未命中哨兵判定。
 - **当前状态**：C++ 引擎仅完成独立运行与对比验证，未接入生产链路，也未用于生产替换。
-- 已知未镜像项：merge 的 Canny snap（`_snap_line_to_canny`），影响主边位置 1~7px，计数验证不受影响。
+- 已知简化项：Q 单边命中（竖直 miss + 水平 hit）分支的“暗侧端点”选择用网格采样近似 Python 的全图均值（当前测试数据未触发差异）。
 - 配置两套：`hough_inspector_params`（明场，生产使用）/ `hough_inspector_dark_params`（暗场，冒烟测试通过，无真实暗场数据验证）。
 
 ## 目录维护约定
