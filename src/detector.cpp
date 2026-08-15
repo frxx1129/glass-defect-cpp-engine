@@ -12,6 +12,8 @@
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <cctype>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -21,6 +23,116 @@
 #include <filesystem>
 
 namespace {
+
+// ============================================================
+// 不检测区域（镜像 Python get_exclusion_zones，image_processor_hough.py:54-117）
+// 仅 Line2 / Line3 且 cam_index==2（cam3）生效；坐标为全图坐标系。
+// ============================================================
+
+std::vector<ExclusionZone> get_exclusion_zones(const std::string& line_name, int cam_index) {
+    std::vector<ExclusionZone> zones;
+    if (cam_index != 2) return zones;
+    if (line_name == "Line2") {
+        zones = {
+            {822,462,295,61},{808,655,310,83},{819,469,49,264},{1071,452,44,290},
+            {1512,460,308,54},{1506,667,305,71},{1480,462,72,293},{1742,465,78,271},
+            {820,989,317,68},{826,1187,286,68},{824,1001,73,225},{1058,979,46,274},
+            {1536,972,274,71},{1544,1165,264,69},{1500,984,63,252},{1754,1027,60,203}
+        };
+    } else if (line_name == "Line3") {
+        zones = {
+            {733,406,32,197},{735,395,267,40},{972,397,25,211},{735,559,273,44},
+            {1390,378,58,213},{1595,368,64,221},{1397,366,261,39},{1390,532,274,46},
+            {742,884,50,225},{745,877,283,110},{974,875,46,228},{747,1064,271,30},
+            {1411,872,44,225},{1409,855,269,49},{1645,855,35,233},{1418,1037,266,56}
+        };
+    }
+    return zones;
+}
+
+// 将不检测区域内的边缘像素清零（ROI 内部坐标）（镜像 apply_exclusion_zones_to_edges）
+void apply_exclusion_zones_to_edges(cv::Mat& edges, int roi_x, int roi_y,
+                                    const std::vector<ExclusionZone>& zones) {
+    if (zones.empty() || edges.empty()) return;
+    const int roi_w = edges.cols, roi_h = edges.rows;
+    for (const auto& z : zones) {
+        int local_x1 = std::max(0, z.x - roi_x);
+        int local_y1 = std::max(0, z.y - roi_y);
+        int local_x2 = std::min(roi_w, z.x + z.width - roi_x);
+        int local_y2 = std::min(roi_h, z.y + z.height - roi_y);
+        if (local_x2 > local_x1 && local_y2 > local_y1) {
+            edges(cv::Rect(local_x1, local_y1, local_x2 - local_x1, local_y2 - local_y1)).setTo(0);
+        }
+    }
+}
+
+// 沿直线采样，返回在 exclusion zones 外的 t 片段（镜像 clip_lines_at_exclusion_zones）
+std::vector<std::pair<double, double>> segments_outside_zones(
+    const cv::Vec4d& line, int roi_x, int roi_y,
+    const std::vector<ExclusionZone>& zones) {
+    std::vector<std::pair<double, double>> out;
+    double gx1 = line[0] + roi_x, gy1 = line[1] + roi_y;
+    double gx2 = line[2] + roi_x, gy2 = line[3] + roi_y;
+    double line_len = std::hypot(gx2 - gx1, gy2 - gy1);
+    if (line_len < 1.0) return out;
+    int num_samples = std::max(50, (int)(line_len / 2.0));
+    auto point_in_zone = [&](double px, double py) {
+        for (const auto& z : zones) {
+            if (z.x <= px && px <= (double)(z.x + z.width) &&
+                z.y <= py && py <= (double)(z.y + z.height)) return true;
+        }
+        return false;
+    };
+    int current_start = -1;
+    for (int i = 0; i <= num_samples; i++) {
+        double t = (double)i / (double)num_samples;
+        double px = gx1 + t * (gx2 - gx1);
+        double py = gy1 + t * (gy2 - gy1);
+        bool in_zone = point_in_zone(px, py);
+        if (!in_zone) {
+            if (current_start < 0) current_start = i;
+        } else if (current_start >= 0) {
+            out.push_back({(double)current_start / num_samples, (double)(i - 1) / num_samples});
+            current_start = -1;
+        }
+    }
+    if (current_start >= 0) out.push_back({(double)current_start / num_samples, 1.0});
+    return out;
+}
+
+// 裁剪穿过 exclusion zones 的主边（镜像 Python clip_lines_at_exclusion_zones，min_segment_len=20）
+std::vector<MergedLine> clip_lines_at_exclusion_zones(
+    std::vector<MergedLine> lines, int roi_x, int roi_y,
+    const std::vector<ExclusionZone>& zones, double min_segment_len) {
+    if (zones.empty() || lines.empty()) return lines;
+    std::vector<MergedLine> result;
+    for (const auto& ml : lines) {
+        const cv::Vec4d& line = ml.line;
+        double len = std::hypot(line[2] - line[0], line[3] - line[1]);
+        if (len < 1.0) continue;
+        auto segs = segments_outside_zones(line, roi_x, roi_y, zones);
+        for (auto [t0, t1] : segs) {
+            cv::Vec4d seg(line[0] + t0 * (line[2] - line[0]),
+                          line[1] + t0 * (line[3] - line[1]),
+                          line[0] + t1 * (line[2] - line[0]),
+                          line[1] + t1 * (line[3] - line[1]));
+            if (std::hypot(seg[2] - seg[0], seg[3] - seg[1]) >= min_segment_len) {
+                MergedLine m = ml;
+                m.line = seg;
+                m.length_px = std::hypot(seg[2] - seg[0], seg[3] - seg[1]);
+                m.angle_deg = line_angle_deg(seg);
+                double a = std::abs(m.angle_deg - 90.0);
+                double ha = std::min(m.angle_deg, 180.0 - m.angle_deg);
+                m.near_vertical = (std::abs(m.angle_deg - 90.0) <= 15.0);
+                m.near_horizontal = (ha <= 15.0);
+                (void)a;
+                result.push_back(m);
+            }
+        }
+        // 若没有足够长的外部片段：Python 丢弃该线（不保留原线）
+    }
+    return result;
+}
 
 // 缺陷标注绘制（镜像 Python _draw_defect_annotations，image_processor_hough.py:6013）。
 // defects 坐标为全图坐标（process_roi 已平移还原）；文本用 ASCII（cv::putText 不支持中文，
@@ -168,8 +280,11 @@ cv::Mat Detector::load_image(const std::string& image_path) {
 namespace {
 
 // 单 ROI：预处理 + Hough + 直线合并（镜像 Python process_roi_hough_based 的 Hough 段）
-std::vector<MergedLine> hough_merge_roi(const cv::Mat& roi_gray, const InspectorParams& params, double px_per_mm) {
+std::vector<MergedLine> hough_merge_roi(const cv::Mat& roi_gray, const InspectorParams& params,
+                                        double px_per_mm, int roi_x, int roi_y,
+                                        const std::vector<ExclusionZone>& zones) {
     cv::Mat edges = preprocess_for_hough_enhanced(roi_gray, params.preprocessing);
+    apply_exclusion_zones_to_edges(edges, roi_x, roi_y, zones);
     std::vector<cv::Vec4i> lines;
     {
         auto round_banker = [](double x) -> int {
@@ -178,12 +293,25 @@ std::vector<MergedLine> hough_merge_roi(const cv::Mat& roi_gray, const Inspector
             if (frac > 0.5 || (frac == 0.5 && std::fmod(r, 2.0) != 0.0)) r += 1.0;
             return (int)r;
         };
-        double min_len = params.hough.min_line_length;
-        if (params.hough.min_line_length_ratio > 0) {
-            double min_base = std::min(roi_gray.cols, roi_gray.rows);
+        double min_len = 0.0;
+        {
+            // 镜像 Python process_roi_hough_based 4735-4760：
+            // min_len = MIN_LINE_LENGTH_MODE 决定的 ROI 基准 * MIN_LINE_LENGTH_RATIO（默认 0.05）。
+            // Python 不读 MIN_LINE_LENGTH 数值键。
+            std::string mode = params.hough.min_line_length_mode;
+            std::transform(mode.begin(), mode.end(), mode.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            double min_base;
+            if (mode == "height" || mode == "h") min_base = (double)roi_gray.rows;
+            else if (mode == "min" || mode == "min_dim" || mode == "mindim")
+                min_base = (double)std::min(roi_gray.cols, roi_gray.rows);
+            else if (mode == "diag" || mode == "diagonal")
+                min_base = std::hypot((double)roi_gray.cols, (double)roi_gray.rows);
+            else min_base = (double)roi_gray.cols; // 其他值按 Python 回退 ROI 宽
             min_len = min_base * params.hough.min_line_length_ratio;
         }
-        double ds_scale = 0.85;
+        double ds_scale = params.hough.downsample_scale;
+        if (ds_scale < 0.2 || ds_scale > 1.0) ds_scale = 0.85; // 镜像 Python 越界回退
         if (ds_scale < 0.999) {
             int w_full = edges.cols, h_full = edges.rows;
             int w_small = std::max(1, round_banker(w_full * ds_scale));
@@ -194,14 +322,18 @@ std::vector<MergedLine> hough_merge_roi(const cv::Mat& roi_gray, const Inspector
             double scale_y = (double)h_full / h_small;
             double scale_len = std::min(1.0, std::min(w_small / (double)std::max(1, w_full),
                                                       h_small / (double)std::max(1, h_full)));
-            int min_len_small = std::max(1, round_banker(min_len * scale_len));
+            // Python: 先把全尺寸 min_len/max_gap 转 int（banker），再乘 scale_len 后转 int（banker）
+            int min_len_full = std::max(1, round_banker(min_len));
             double max_gap_full = params.hough.max_line_gap_mm > 0
                 ? params.hough.max_line_gap_mm * px_per_mm : params.hough.max_line_gap;
-            int max_gap_small = std::max(0, round_banker(max_gap_full * scale_len));
+            int max_gap_full_i = std::max(0, round_banker(max_gap_full));
+            int min_len_small = std::max(1, round_banker((double)min_len_full * scale_len));
+            int max_gap_small = std::max(0, round_banker((double)max_gap_full_i * scale_len));
             std::vector<cv::Vec4i> raw_small;
+            // Python 调用 HoughLinesP 硬编码 rho=1、theta=π/180
             cv::HoughLinesP(edges_small, raw_small,
-                            params.hough.rho,
-                            params.hough.theta_deg * CV_PI / 180.0,
+                            1.0,
+                            CV_PI / 180.0,
                             params.hough.threshold,
                             min_len_small,
                             max_gap_small);
@@ -218,8 +350,8 @@ std::vector<MergedLine> hough_merge_roi(const cv::Mat& roi_gray, const Inspector
             int min_len_i = std::max(1, round_banker(min_len));
             int max_gap_i = std::max(0, round_banker(max_gap_full));
             cv::HoughLinesP(edges, lines,
-                            params.hough.rho,
-                            params.hough.theta_deg * CV_PI / 180.0,
+                            1.0,
+                            CV_PI / 180.0,
                             params.hough.threshold,
                             min_len_i,
                             max_gap_i);
@@ -243,9 +375,50 @@ std::vector<MergedLine> hough_merge_roi(const cv::Mat& roi_gray, const Inspector
     return merge_lines_and_get_main_edges(lines, params, px_per_mm, edges);
 }
 
+// 银行家舍入（镜像 Python round / int(round())）
+inline int round_banker_global(double x) {
+    double r = std::floor(x);
+    double frac = x - r;
+    if (frac > 0.5 || (frac == 0.5 && std::fmod(r, 2.0) != 0.0)) r += 1.0;
+    return (int)r;
+}
+
 inline double fold_angle_deg_abs(double a) {
     a = std::fmod(std::abs(a), 180.0);
     return a <= 90.0 ? a : 180.0 - a;
+}
+
+// Python calculate_angle_between_lines（[0,90] + 90°邻域修约 _adjust_angle_near_90）
+double angle_between_lines_adjust(const cv::Vec4d& l1, const cv::Vec4d& l2) {
+    double v1x = l1[2] - l1[0], v1y = l1[3] - l1[1];
+    double v2x = l2[2] - l2[0], v2y = l2[3] - l2[1];
+    double m1 = std::hypot(v1x, v1y), m2 = std::hypot(v2x, v2y);
+    if (m1 < 1e-9 || m2 < 1e-9) return 0.0;
+    double cosine = (v1x * v2x + v1y * v2y) / (m1 * m2);
+    cosine = std::max(-1.0, std::min(1.0, cosine));
+    double deg = std::acos(cosine) * 180.0 / CV_PI;
+    if (deg > 90.0) deg = 180.0 - deg;
+    if (deg >= 86.0 && deg <= 94.0) return 90.0;
+    if (deg >= 80.0 && deg <= 100.0) return 90.0 + 0.5 * (deg - 90.0);
+    return deg;
+}
+
+// Python get_point_line_segment_projection 的距离部分（投影夹紧到线段）
+double point_to_segment_dist(double px, double py, const cv::Vec4d& l) {
+    double vx = l[2] - l[0], vy = l[3] - l[1];
+    double lv = vx * vx + vy * vy;
+    if (lv < 1e-9) return std::hypot(px - l[0], py - l[1]);
+    double t = ((px - l[0]) * vx + (py - l[1]) * vy) / lv;
+    t = std::max(0.0, std::min(1.0, t));
+    return std::hypot(px - (l[0] + t * vx), py - (l[1] + t * vy));
+}
+
+// 点到无限直线的垂直距离（Python get_point_line_perpendicular_distance）
+double point_to_line_dist_inf(double px, double py, const cv::Vec4d& l) {
+    double vx = l[2] - l[0], vy = l[3] - l[1];
+    double len = std::hypot(vx, vy);
+    if (len < 1e-8) return std::hypot(px - l[0], py - l[1]);
+    return std::abs(vx * (py - l[1]) - vy * (px - l[0])) / len;
 }
 
 // 无限直线裁剪到 ROI 局部矩形（镜像 Python _clip_infinite_line_to_roi_local，4835-4871）
@@ -502,7 +675,8 @@ std::vector<Defect> Detector::process_roi(
     const InspectorParams& params,
     int roi_idx,
     const std::vector<MergedLine>& merged_in,
-    const std::vector<cv::Vec4d>& shared_verticals)
+    const std::vector<cv::Vec4d>& shared_verticals,
+    const std::vector<ExclusionZone>& zones)
 {
     // 裁剪 ROI（越界保护）
     int x0 = std::max(0, roi.x);
@@ -514,12 +688,18 @@ std::vector<Defect> Detector::process_roi(
 
     // 预处理 + Hough + 直线合并（镜像 Python process_roi_hough_based 的 Hough 段）
     std::vector<MergedLine> merged = merged_in.empty()
-        ? hough_merge_roi(roi_gray, params, px_per_mm_)
+        ? hough_merge_roi(roi_gray, params, px_per_mm_, roi.x, roi.y, zones)
         : merged_in;
+
+    // 裁剪穿过 exclusion zones 的主边（镜像 Python 4817-4822）
+    merged = clip_lines_at_exclusion_zones(merged, roi.x, roi.y, zones, 20.0);
 
     // 跨 ROI 共享竖直边注入（镜像 Python 4873-5027）：把整图收集的竖直边并入本 ROI 主边，
     // 使 B 亮度扫描能覆盖跨 ROI 的竖直玻璃边缘
     inject_shared_verticals(merged, shared_verticals, roi, params, px_per_mm_);
+
+    // 共享竖直边注入后再次裁剪 exclusion zones（镜像 Python 5191-5195）
+    merged = clip_lines_at_exclusion_zones(merged, roi.x, roi.y, zones, 20.0);
 
 #ifdef CPP_DEBUG_MERGED
     for (auto& ml : merged) {
@@ -604,13 +784,14 @@ std::vector<Defect> Detector::process_roi(
             cv::drawContours(defect_canvas, all_chipping_contours, -1, cv::Scalar(255), -1);
 
             // MORPH_CLOSE 核尺寸：优先 MERGE_DEFECTS_KERNEL_MM * px_per_mm 转奇数，否则用 KERNEL_SIZE
+            // （Python _kernel_mm_to_px_odd：int(round(mm*ppm)) 银行家舍入；fallback 默认 [5,5]）
             int kx = params.defect_detection.merge_defects_kernel_size.size() > 0
-                ? params.defect_detection.merge_defects_kernel_size[0] : 9;
+                ? params.defect_detection.merge_defects_kernel_size[0] : 5;
             int ky = params.defect_detection.merge_defects_kernel_size.size() > 1
-                ? params.defect_detection.merge_defects_kernel_size[1] : 9;
+                ? params.defect_detection.merge_defects_kernel_size[1] : 5;
             if (params.defect_detection.merge_defects_kernel_mm.size() >= 2) {
-                int kx_mm = (int)std::lround(params.defect_detection.merge_defects_kernel_mm[0] * px_per_mm_);
-                int ky_mm = (int)std::lround(params.defect_detection.merge_defects_kernel_mm[1] * px_per_mm_);
+                int kx_mm = round_banker_global(params.defect_detection.merge_defects_kernel_mm[0] * px_per_mm_);
+                int ky_mm = round_banker_global(params.defect_detection.merge_defects_kernel_mm[1] * px_per_mm_);
                 if (kx_mm >= 1) kx = (kx_mm % 2 == 0) ? kx_mm + 1 : kx_mm;
                 if (ky_mm >= 1) ky = (ky_mm % 2 == 0) ? ky_mm + 1 : ky_mm;
             }
@@ -645,11 +826,17 @@ std::vector<Defect> Detector::process_roi(
                 Defect d;
                 d.type = "B";
                 d.confidence = 0.65;
-                for (auto& pt : pts)
-                    d.box_points.push_back(cv::Point((int)std::lround(pt.x), (int)std::lround(pt.y)));
-                d.region_contour = cnt;   // 保留合并后轮廓（阴影过滤用）
-                d.x = (int)std::lround(rr.center.x);
-                d.y = (int)std::lround(rr.center.y);
+                // Python：box_points = cv2.boxPoints(...).astype(np.int32)（向零截断），
+                // location 中心 = int(mean(box_points))（截断）
+                double cx = 0.0, cy = 0.0;
+                for (auto& pt : pts) {
+                    d.box_points.push_back(cv::Point((int)pt.x, (int)pt.y));
+                    cx += pt.x; cy += pt.y;
+                }
+                cx /= 4.0; cy /= 4.0;
+                d.region_contour = cnt;   // 保留合并后轮廓（阴影/圆形度过滤用）
+                d.x = (int)cx;
+                d.y = (int)cy;
                 double w_px = std::max(rr.size.width, rr.size.height);
                 double h_px = std::min(rr.size.width, rr.size.height);
                 d.length_mm = w_px / px_per_mm_;
@@ -662,8 +849,68 @@ std::vector<Defect> Detector::process_roi(
     }
     for (auto& d : defects) d.roi_index = roi_idx;
 
-    // B 过滤链（镜像 Python final_chipping_defects / report 阶段 B 规则）
+    // B 过滤链（镜像 Python find_and_analyze_defects 的 B 距离门控 + process_roi 的
+    // 阴影/圆形度/平行抑制/B→L/L 过滤链，image_processor_hough.py:4229-4360、5478-5689）
     {
+        // L 端点扫描带掩膜（镜像 Python 5235-5272）：宽=亮度扫描带宽，长=L_ENDPOINT_BELT_LENGTH_MM
+        cv::Mat l_endpoint_belt_mask;
+        double scan_width_for_belt = params.defect_detection.luminosity_scan_width_mm > 0
+            ? params.defect_detection.luminosity_scan_width_mm * px_per_mm_
+            : (double)params.defect_detection.luminosity_scan_width;
+        double belt_len_px = params.defect_detection.l_endpoint_belt_length_mm * px_per_mm_;
+        if (scan_width_for_belt > 0 && belt_len_px > 0 && !merged.empty()) {
+            l_endpoint_belt_mask = cv::Mat::zeros(roi_gray.size(), CV_8U);
+            for (auto& ml : merged) {
+                cv::Point2d p1(ml.line[0], ml.line[1]), p2(ml.line[2], ml.line[3]);
+                double vx = p2.x - p1.x, vy = p2.y - p1.y;
+                double L = std::hypot(vx, vy);
+                if (L < 1e-6) continue;
+                double ux = vx / L, uy = vy / L;
+                double nx = -uy, ny = ux;
+                double hwx = 0.5 * scan_width_for_belt * nx;
+                double hwy = 0.5 * scan_width_for_belt * ny;
+                double d = std::min(belt_len_px, L);
+                // 两端的短矩形
+                cv::Point2d s1 = p1, e1 = p1 + cv::Point2d(ux * d, uy * d);
+                cv::Point2d s2 = p2, e2 = p2 - cv::Point2d(ux * d, uy * d);
+                std::vector<cv::Point> poly1 = {
+                    cv::Point((int)(s1.x + hwx), (int)(s1.y + hwy)),
+                    cv::Point((int)(e1.x + hwx), (int)(e1.y + hwy)),
+                    cv::Point((int)(e1.x - hwx), (int)(e1.y - hwy)),
+                    cv::Point((int)(s1.x - hwx), (int)(s1.y - hwy))};
+                std::vector<cv::Point> poly2 = {
+                    cv::Point((int)(s2.x + hwx), (int)(s2.y + hwy)),
+                    cv::Point((int)(e2.x + hwx), (int)(e2.y + hwy)),
+                    cv::Point((int)(e2.x - hwx), (int)(e2.y - hwy)),
+                    cv::Point((int)(s2.x - hwx), (int)(s2.y - hwy))};
+                cv::fillPoly(l_endpoint_belt_mask,
+                             std::vector<std::vector<cv::Point>>{poly1, poly2}, cv::Scalar(255));
+            }
+        }
+
+        // box_points 中相邻边里最长的一边（镜像 Python adj_pairs + argmax(lengths)）
+        auto box_long_edge = [](const std::vector<cv::Point>& box) -> cv::Vec4d {
+            if (box.size() < 4) return cv::Vec4d(0, 0, 0, 0);
+            std::pair<int, double> best{0, -1.0};
+            for (int k = 0; k < 4; k++) {
+                const cv::Point& a = box[k];
+                const cv::Point& b = box[(k + 1) % 4];
+                double L = std::hypot((double)(b.x - a.x), (double)(b.y - a.y));
+                if (L > best.second) best = {k, L};
+            }
+            return cv::Vec4d(box[best.first].x, box[best.first].y,
+                             box[(best.first + 1) % 4].x, box[(best.first + 1) % 4].y);
+        };
+        auto nearest_edge = [&](const cv::Point2d& center) -> cv::Vec4d {
+            double best_d = std::numeric_limits<double>::infinity();
+            cv::Vec4d best(0, 0, 0, 0);
+            for (auto& ml : merged) {
+                double d = point_to_segment_dist(center.x, center.y, ml.line);
+                if (d < best_d) { best_d = d; best = ml.line; }
+            }
+            return best;
+        };
+
         std::vector<Defect> b_filtered;
         for (auto& d : defects) {
             if (d.type != "B") { b_filtered.push_back(d); continue; }
@@ -674,25 +921,22 @@ std::vector<Defect> Detector::process_roi(
             double width_mm = h_px / px_per_mm_;
             double length_mm = w_px / px_per_mm_;
             double ar = h_px > 1e-6 ? w_px / h_px : 1e9;
+            cv::Point2d center(rr.center.x, rr.center.y);
 
-            // 1) 细长窄门控：ar>10 且宽<2mm → 距主边 >5mm 过滤
+            // 1) find_and_analyze_defects 内：细长窄 B 距主边过远门控
+            //    （ar>B_FILTER_PARALLEL_AR_MIN 且宽<B_FILTER_PARALLEL_MIN_SIDE_MM → 中心到无限直线 > B_MAX_DISTANCE_TO_EDGE_MM 过滤）
             double ar_min_gate = params.defect_detection.b_filter_parallel_ar_min > 0
                 ? params.defect_detection.b_filter_parallel_ar_min : 10.0;
             double min_side_gate = params.defect_detection.b_filter_parallel_min_side_mm > 0
                 ? params.defect_detection.b_filter_parallel_min_side_mm : 2.0;
-            double max_edge_dist = params.defect_detection.b_max_distance_to_edge_mm > 0
-                ? params.defect_detection.b_max_distance_to_edge_mm : 5.0;
+            double max_edge_dist_px = params.defect_detection.b_max_distance_to_edge_mm * px_per_mm_;
             if (ar > ar_min_gate && width_mm < min_side_gate) {
-                cv::Point2d center(rr.center.x, rr.center.y);
-                double min_d = 1e18;
-                for (auto& ml : merged) {
-                    double dpx = std::abs((ml.line[2]-ml.line[0]) * (ml.line[1]-center.y) -
-                                          (ml.line[3]-ml.line[1]) * (ml.line[0]-center.x)) /
-                                 std::max(1e-6, ml.length_px);
-                    min_d = std::min(min_d, dpx);
-                }
-                if (min_d > max_edge_dist * px_per_mm_) continue; // 距主边过远，过滤
+                double min_d = std::numeric_limits<double>::infinity();
+                for (auto& ml : merged)
+                    min_d = std::min(min_d, point_to_line_dist_inf(center.x, center.y, ml.line));
+                if (min_d > max_edge_dist_px) continue;
             }
+
             // 2) 阴影过滤：contour 面积 / minAreaRect 面积 < SHADOW_FILTER_MIN_EXTENT_RATIO
             if (!d.region_contour.empty()) {
                 double contour_area = std::abs(cv::contourArea(d.region_contour));
@@ -701,36 +945,78 @@ std::vector<Defect> Detector::process_roi(
                     ? params.defect_detection.shadow_filter_min_extent_ratio : 0.25;
                 if (rect_area > 1e-6 && (contour_area / rect_area) < min_extent) continue;
             }
-            // 3) MIN_WIDTH 过滤（未转 L 的 B）：宽 < MIN_WIDTH_MM 过滤
-            double min_width_rule = params.defect_detection.min_width_mm > 0
-                ? params.defect_detection.min_width_mm : 5.0;
-            if (width_mm < min_width_rule) continue;
-            // 4) 面积/宽度启发式：面积<25mm2 且宽<5mm 过滤
-            double area_mm2 = length_mm * width_mm;
-            if (area_mm2 < 25.0 && width_mm < params.defect_detection.min_defect_size_mm) continue;
 
-            // 5) B→L 重分类：ar>7.5 且长边近似垂直主边（角度差 > 90-tol）
+            // 3) 圆形度过滤（默认关闭）
+            if (params.defect_detection.b_filter_circularity_enabled &&
+                !d.region_contour.empty() && d.region_contour.size() >= 5) {
+                double area = std::abs(cv::contourArea(d.region_contour));
+                double perimeter = cv::arcLength(d.region_contour, true);
+                if (perimeter > 1e-6) {
+                    double circularity = 4.0 * CV_PI * area / (perimeter * perimeter);
+                    if (circularity > params.defect_detection.b_circularity_threshold) continue;
+                }
+            }
+
+            // 4) 平行抑制：长边与最近主边（线段投影距离）平行（<=容差），
+            //    且 (ar>B_FILTER_PARALLEL_AR_MIN 或 宽<B_FILTER_PARALLEL_MIN_SIDE_MM) → 过滤
+            {
+                cv::Vec4d long_seg = box_long_edge(d.box_points);
+                cv::Vec4d near_edge = nearest_edge(center);
+                double parallel_angle = angle_between_lines_adjust(long_seg, near_edge);
+                double parallel_tol = params.defect_detection.b_filter_parallel_tolerance_deg > 0
+                    ? params.defect_detection.b_filter_parallel_tolerance_deg : 10.0;
+                if (parallel_angle <= parallel_tol &&
+                    (ar > ar_min_gate || width_mm < min_side_gate)) {
+                    continue;
+                }
+            }
+
+            // 5) B→L 重分类：ar>B_TO_L_MIN_AR 且长边与最近主边近似垂直
+            //    （calculate_angle_between_lines 含 90° 邻域修约）
             double min_ar_l = params.defect_detection.b_to_l_min_ar > 0
                 ? params.defect_detection.b_to_l_min_ar : 7.5;
             double perp_tol = params.defect_detection.b_to_l_perp_tolerance_deg > 0
                 ? params.defect_detection.b_to_l_perp_tolerance_deg : 10.0;
+            double perp_angle = 0.0;
+            bool is_perp = false;
             if (ar > min_ar_l) {
-                // 长边方向（minAreaRect 长边角度）
-                double long_ang = rr.angle;
-                if (w_px < h_px) long_ang += 90.0;
-                long_ang = std::fmod(std::abs(long_ang), 180.0);
-                if (long_ang > 90.0) long_ang = 180.0 - long_ang;
-                bool is_perp = false;
-                for (auto& ml : merged) {
-                    // ml.angle_deg 为 [0,180) 真实角度，先折叠到 [0,90] 再比较
-                    double mla = std::fmod(std::abs(ml.angle_deg), 180.0);
-                    if (mla > 90.0) mla = 180.0 - mla;
-                    double ang_diff = std::abs(mla - long_ang);
-                    ang_diff = std::min(ang_diff, 180.0 - ang_diff);
-                    if (ang_diff >= (90.0 - perp_tol)) { is_perp = true; break; }
-                }
-                if (is_perp) d.type = "L";
+                cv::Vec4d long_seg = box_long_edge(d.box_points);
+                cv::Vec4d near_edge = nearest_edge(center);
+                perp_angle = angle_between_lines_adjust(long_seg, near_edge);
+                is_perp = perp_angle >= (90.0 - perp_tol);
             }
+
+            double area_mm2 = length_mm * width_mm;
+            if (is_perp) {
+                d.type = "L";
+                // L 端点扫描带过滤（Python 5627-5638）
+                if (!l_endpoint_belt_mask.empty() && d.box_points.size() >= 4) {
+                    cv::Mat tmp = cv::Mat::zeros(roi_gray.size(), CV_8U);
+                    cv::fillPoly(tmp, std::vector<std::vector<cv::Point>>{d.box_points}, cv::Scalar(255));
+                    cv::Mat inter;
+                    cv::bitwise_and(tmp, l_endpoint_belt_mask, inter);
+                    if (cv::countNonZero(inter) > 0) continue;
+                }
+                // L_FROM_B_SMALL_AREA（Python 5654-5664）
+                if (area_mm2 < 25.0 && width_mm < 2.0) continue;
+                // L 近主边过滤（Python 5667-5689）：中心到任一主边无限直线 <= L_FILTER_MAX_DISTANCE_TO_EDGE_MM
+                double l_max_edge_mm = params.defect_detection.l_filter_max_distance_to_edge_mm;
+                bool near_main = false;
+                for (auto& ml : merged) {
+                    double dpx = point_to_line_dist_inf(center.x, center.y, ml.line);
+                    if (dpx / px_per_mm_ <= l_max_edge_mm) { near_main = true; break; }
+                }
+                if (near_main) continue;
+            } else {
+                // 仅对仍为 B 的缺陷应用 B 专属筛选（Python 5640-5648）
+                double min_width_rule = params.defect_detection.min_width_mm > 0
+                    ? params.defect_detection.min_width_mm : 5.0;
+                if (width_mm < min_width_rule) continue;
+                double min_size_rule = params.defect_detection.min_defect_size_mm > 0
+                    ? params.defect_detection.min_defect_size_mm : 3.0;
+                if (area_mm2 < 25.0 && width_mm < min_size_rule) continue;
+            }
+
             d.width_mm = width_mm;
             d.length_mm = length_mm;
             d.size_mm = std::max(width_mm, length_mm);
@@ -741,8 +1027,27 @@ std::vector<Defect> Detector::process_roi(
 
     // 缺陷来源 2：E 型边缘异常（缺陷边缘图 + 主边屏蔽带 + 轮廓分析）
     cv::Mat defect_edges = preprocess_for_defect_edges(roi_gray, params.preprocessing);
+    // 对缺陷边缘图同样应用 exclusion zones（镜像 Python 4728-4729）
+    apply_exclusion_zones_to_edges(defect_edges, roi.x, roi.y, zones);
     auto e_defects = detect_e_defects(roi_gray, defect_edges, merged, params, px_per_mm_);
     for (auto& d : e_defects) d.roi_index = roi_idx;
+    // E 类型 exclusion zone 过滤（镜像 Python 5297-5329）：box_points 任一点落入 zone 则丢弃
+    if (!zones.empty()) {
+        std::vector<Defect> kept_e;
+        for (auto& d : e_defects) {
+            bool in_zone = false;
+            for (auto& pt : d.box_points) {
+                double gx = pt.x + roi.x, gy = pt.y + roi.y;
+                for (auto& z : zones) {
+                    if (z.x <= gx && gx <= (double)(z.x + z.width) &&
+                        z.y <= gy && gy <= (double)(z.y + z.height)) { in_zone = true; break; }
+                }
+                if (in_zone) break;
+            }
+            if (!in_zone) kept_e.push_back(d);
+        }
+        e_defects = kept_e;
+    }
     defects.insert(defects.end(), e_defects.begin(), e_defects.end());
 
     // 缺陷来源 3：Q 角点（缺角）检测（角点配对 + 射线求交 + 三角形判定）
@@ -750,19 +1055,32 @@ std::vector<Defect> Detector::process_roi(
     for (auto& d : q_defects) d.roi_index = roi_idx;
     defects.insert(defects.end(), q_defects.begin(), q_defects.end());
 
-    // 预过滤（镜像 Python QBL_PREFILTER_MIN_WIDTH）：Q/B/L 宽度 < PREFILTER_MIN_WIDTH_MM 过滤
+    // 预过滤（镜像 Python QBL_PREFILTER_MIN_WIDTH）：
+    // PREFILTER_MIN_WIDTH_MM 缺省时回退 MIN_WIDTH_MM（再缺省 3.0）
     double prefilter_min_width = params.defect_detection.prefilter_min_width_mm > 0
         ? params.defect_detection.prefilter_min_width_mm
-        : params.defect_detection.min_width_mm;
+        : (params.defect_detection.min_width_mm > 0 ? params.defect_detection.min_width_mm : 3.0);
     if (prefilter_min_width > 0) {
         std::vector<Defect> kept;
         for (auto& d : defects) {
             if (d.type == "Q" || d.type == "B" || d.type == "L") {
                 if (d.width_mm < prefilter_min_width) continue;
-                // Q 长度范围过滤
+                // Q 长度范围过滤（Python：min/max 为 0 时该项不限制）
                 if (d.type == "Q" && params.defect_detection.q_length_range_filter_enable) {
-                    if (d.length_mm < params.defect_detection.q_length_min_mm ||
-                        d.length_mm > params.defect_detection.q_length_max_mm) continue;
+                    double q_min = params.defect_detection.q_length_min_mm;
+                    double q_max = params.defect_detection.q_length_max_mm;
+                    if ((q_min > 0 && d.length_mm < q_min) || (q_max > 0 && d.length_mm > q_max)) continue;
+                }
+                // Q 后置过滤（镜像 Python process_roi 5552-5569）：
+                // area<2.25、AR>20、短边<2、长度<MIN_DEFECT_SIZE_MM 均丢弃
+                if (d.type == "Q") {
+                    double q_area = d.length_mm * d.width_mm;
+                    double q_ar = d.width_mm > 1e-6 ? d.length_mm / d.width_mm : 1e9;
+                    double q_min_size = params.defect_detection.min_defect_size_mm > 0
+                        ? params.defect_detection.min_defect_size_mm : 3.0;
+                    if (q_area < 2.25 || q_ar > 20.0 ||
+                        std::min(d.length_mm, d.width_mm) < 2.0 ||
+                        d.length_mm < q_min_size) continue;
                 }
             }
             kept.push_back(d);
@@ -799,6 +1117,10 @@ DetectionResult Detector::detect(const cv::Mat& image_gray) {
     // 选择参数（明场默认；暗场由请求注入 mode="dark"）
     const InspectorParams* params = (config_.mode == "dark") ? &config_.dark : &config_.light;
 
+    // 不检测区域（仅 Line2/Line3 cam3；镜像 Python get_exclusion_zones）
+    const std::vector<ExclusionZone> zones =
+        get_exclusion_zones(params->runtime_line_name, params->runtime_cam_index);
+
     // 加载 ROI
     std::vector<RoiRect> rois = external_rois_;
     if (rois.empty() && !params->roi_template_file.empty()) {
@@ -819,11 +1141,13 @@ DetectionResult Detector::detect(const cv::Mat& image_gray) {
             int y1 = std::min(image_gray.rows, rois[i].y + rois[i].height);
             if (x1 <= x0 || y1 <= y0) { per_roi_merged.emplace_back(); continue; }
             cv::Mat roi_gray = image_gray(cv::Rect(x0, y0, x1 - x0, y1 - y0));
-            per_roi_merged.push_back(hough_merge_roi(roi_gray, *params, px_per_mm_));
+            auto merged_i = hough_merge_roi(roi_gray, *params, px_per_mm_, rois[i].x, rois[i].y, zones);
+            // 跨 ROI 预收集阶段也裁剪 zones（镜像 Python 6457-6459，min_segment_len=10）
+            per_roi_merged.push_back(clip_lines_at_exclusion_zones(merged_i, rois[i].x, rois[i].y, zones, 10.0));
         }
         std::vector<cv::Vec4d> shared = collect_shared_vertical_edges(rois, per_roi_merged, *params, px_per_mm_);
         for (size_t i = 0; i < rois.size(); i++) {
-            auto defects = process_roi(image_gray, rois[i], *params, (int)i, per_roi_merged[i], shared);
+            auto defects = process_roi(image_gray, rois[i], *params, (int)i, per_roi_merged[i], shared, zones);
             all_defects.insert(all_defects.end(), defects.begin(), defects.end());
             RoiResult rr;
             rr.roi = rois[i];

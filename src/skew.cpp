@@ -87,7 +87,12 @@ std::vector<Defect> detect_e_defects(
     const DefectDetectParams& dd = params.defect_detection;
     const int h_img = defect_edges.rows, w_img = defect_edges.cols;
     double v_tol = dd.vertical_angle_tol_deg > 0 ? dd.vertical_angle_tol_deg : 10.0;
-    double h_tol = v_tol;
+    // 镜像 Python 三处不同容差：
+    //  1) 主边屏蔽带：HORIZONTAL_ANGLE_TOL_DEG 缺省 10（image_processor_hough.py:2876）
+    //  2) 轮廓角度过滤：HORIZONTAL_ANGLE_TOL_DEG 缺省 v_tol（:3064）
+    //  3) E_FROM_MAIN：HORIZONTAL_ANGLE_TOL_DEG 缺省 10（:3106）
+    double h_tol_mask = dd.horizontal_angle_tol_deg > 0 ? dd.horizontal_angle_tol_deg : 10.0;
+    double h_tol_contour = dd.horizontal_angle_tol_deg > 0 ? dd.horizontal_angle_tol_deg : v_tol;
 
     // ---- 1. 边缘准备：膨胀 -> 屏蔽主边带 -> Closing -> 再屏蔽 ----
     cv::Mat edges_base;
@@ -113,7 +118,7 @@ std::vector<Defect> detect_e_defects(
         for (auto& ml : true_edges) {
             // 折叠到 [0,90]（镜像 Python：ang = abs(atan2); if ang>90: ang=180-ang）
             double ang = angle_abs_deg(ml.angle_deg);
-            if (ang >= (90.0 - v_tol) || ang <= h_tol) {
+            if (ang >= (90.0 - v_tol) || ang <= h_tol_mask) {
                 cv::Vec4d clipped = clip_line_to_roi(ml.line, w_img, h_img);
                 cv::line(mask_lines,
                          cv::Point((int)std::lround(clipped[0]), (int)std::lround(clipped[1])),
@@ -232,7 +237,7 @@ std::vector<Defect> detect_e_defects(
             if (rect.size.width < rect.size.height) ang = std::abs(rect.angle + 90.0);
             if (ang > 90.0) ang -= 90.0;
 
-            if (ang <= h_tol || ang >= (90.0 - v_tol)) continue;
+            if (ang <= h_tol_contour || ang >= (90.0 - v_tol)) continue;
 
             cv::Point2f box_pts[4];
             rect.points(box_pts);

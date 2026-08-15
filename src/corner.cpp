@@ -16,6 +16,14 @@ inline double angle_x_deg(const cv::Vec4d& l) {
 inline bool is_vert(const cv::Vec4d& l, double tol) { return angle_x_deg(l) >= (90.0 - tol); }
 inline bool is_horiz(const cv::Vec4d& l, double tol) { return angle_x_deg(l) <= tol; }
 
+// 银行家舍入（镜像 Python round：.5 取偶数）
+inline int round_banker(double x) {
+    double r = std::floor(x);
+    double frac = x - r;
+    if (frac > 0.5 || (frac == 0.5 && std::fmod(r, 2.0) != 0.0)) r += 1.0;
+    return (int)r;
+}
+
 // 两直线交点（无限延长）；平行返回 false
 bool line_intersection(const cv::Vec4d& a, const cv::Vec4d& b, cv::Point2d& out) {
     double ax = a[2] - a[0], ay = a[3] - a[1];
@@ -79,7 +87,8 @@ bool q_parallelogram_cluster_ok(const Defect& q, const cv::Mat& edges_img, const
         return std::atan2(a.y - cen.y, a.x - cen.x) < std::atan2(b.y - cen.y, b.x - cen.x);
     });
     std::vector<cv::Point> contour;
-    for (auto& p : quad) contour.push_back(cv::Point((int)std::lround(p.x), (int)std::lround(p.y)));
+    // Python pg.astype(np.int32) 是向零截断，不能用 lround
+    for (auto& p : quad) contour.push_back(cv::Point((int)p.x, (int)p.y));
     std::vector<std::vector<cv::Point>> polys{contour};
 
     cv::Mat mask = cv::Mat::zeros(H, W, CV_8U);
@@ -105,8 +114,8 @@ bool q_parallelogram_cluster_ok(const Defect& q, const cv::Mat& edges_img, const
             cv::Point2d s = mid - u * L;
             cv::Point2d e = mid + u * L;
             cv::line(exclude,
-                     cv::Point((int)std::lround(s.x), (int)std::lround(s.y)),
-                     cv::Point((int)std::lround(e.x), (int)std::lround(e.y)),
+                     cv::Point(round_banker(s.x), round_banker(s.y)),
+                     cv::Point(round_banker(e.x), round_banker(e.y)),
                      cv::Scalar(255), thick, cv::LINE_AA);
         }
         cv::Mat not_excl;
@@ -116,19 +125,29 @@ bool q_parallelogram_cluster_ok(const Defect& q, const cv::Mat& edges_img, const
 
     cv::Mat cand;
     cv::bitwise_and(edges_img, edges_img, cand, inner);
-    cv::dilate(cand, cand, cv::Mat::ones(3, 3, CV_8U), cv::Point(-1, -1), 1);
+    if (dd.q_parallelogram_use_dilate) {
+        cv::dilate(cand, cand, cv::Mat::ones(3, 3, CV_8U), cv::Point(-1, -1), 1);
+    }
 
     cv::Mat labels, stats, centroids;
     int num_labels = cv::connectedComponentsWithStats(cand, labels, stats, centroids, 8, CV_32S);
     if (num_labels <= 1) return false;
 
-    const int min_pixels = 50;              // Q_PARALLELOGRAM_MIN_EDGE_PIXELS
-    const double span_frac = 0.25;          // Q_PARALLELOGRAM_MIN_SPAN_FRAC
+    const int min_pixels = dd.q_parallelogram_min_edge_pixels;  // Q_PARALLELOGRAM_MIN_EDGE_PIXELS
+    const double span_frac = dd.q_parallelogram_min_span_frac;  // Q_PARALLELOGRAM_MIN_SPAN_FRAC
     cv::Point2d diag = Q - P;
     double diag_len = cv::norm(diag);
     if (diag_len <= 1.0) return false;
     cv::Point2d u(diag.x / diag_len, diag.y / diag_len);
     double need_span = span_frac * diag_len;
+#ifdef CPP_DEBUG_Q
+    std::cerr << "[Q-PARA] quad=(" << contour[0].x << "," << contour[0].y << ")(" << contour[1].x << "," << contour[1].y
+              << ")(" << contour[2].x << "," << contour[2].y << ")(" << contour[3].x << "," << contour[3].y
+              << ") cand_nz=" << cv::countNonZero(cand) << " nlab=" << num_labels
+              << " need_span=" << need_span << std::endl;
+    for (int lbl = 1; lbl < num_labels; lbl++)
+        std::cerr << "  [Q-PARA] lab=" << lbl << " area=" << stats.at<int>(lbl, cv::CC_STAT_AREA) << std::endl;
+#endif
     for (int lbl = 1; lbl < num_labels; lbl++) {
         int cnt = stats.at<int>(lbl, cv::CC_STAT_AREA);
         if (cnt < min_pixels) continue;
@@ -150,7 +169,9 @@ bool q_parallelogram_cluster_ok(const Defect& q, const cv::Mat& edges_img, const
 
 // 主体聚类：近竖直边 x 中点间隙二分（镜像 Python find_and_analyze_defects 的 cluster 划分：
 // 无 >=2 条竖直边时回退到“全部边的 X/Y 中点最大间隙”二分）
-std::vector<int> build_clusters(const std::vector<MergedLine>& edges, double v_tol, int roi_w) {
+// eff_gap_px: 优先 GLASS_CLUSTER_GAP_MM，否则 8% ROI 宽
+std::vector<int> build_clusters(const std::vector<MergedLine>& edges, double v_tol, int roi_w,
+                                double eff_gap_px) {
     std::vector<int> labels(edges.size(), 0);
     std::vector<std::pair<double, int>> xs;
     for (size_t i = 0; i < edges.size(); i++)
@@ -163,8 +184,7 @@ std::vector<int> build_clusters(const std::vector<MergedLine>& edges, double v_t
             double g = xs[k + 1].first - xs[k].first;
             if (g > max_gap) { max_gap = g; max_k = (int)k; }
         }
-        double eff_gap = 0.08 * roi_w;
-        if (max_k >= 0 && max_gap >= eff_gap) {
+        if (max_k >= 0 && max_gap >= eff_gap_px) {
             double th = 0.5 * (xs[max_k].first + xs[max_k + 1].first);
             for (size_t i = 0; i < edges.size(); i++) {
                 double mx = (edges[i].line[0] + edges[i].line[2]) * 0.5;
@@ -176,8 +196,7 @@ std::vector<int> build_clusters(const std::vector<MergedLine>& edges, double v_t
     // 的最大间隙二分（Python: np.max(cluster_labels)==0 and len(edges)>=4 and eff_gap>0）
     bool any_one = false;
     for (auto l : labels) if (l == 1) { any_one = true; break; }
-    double eff_gap = 0.08 * roi_w;
-    if (!any_one && edges.size() >= 4 && eff_gap > 0) {
+    if (!any_one && edges.size() >= 4 && eff_gap_px > 0) {
         for (int dim = 0; dim < 2; dim++) {
             std::vector<std::pair<double, int>> ord;
             for (size_t i = 0; i < edges.size(); i++) {
@@ -191,7 +210,7 @@ std::vector<int> build_clusters(const std::vector<MergedLine>& edges, double v_t
                 double g = ord[k + 1].first - ord[k].first;
                 if (g > max_gap) { max_gap = g; max_k = (int)k; }
             }
-            if (max_k >= 0 && max_gap >= eff_gap) {
+            if (max_k >= 0 && max_gap >= eff_gap_px) {
                 for (size_t k = 0; k < ord.size(); k++)
                     labels[ord[k].second] = (int)k <= max_k ? 0 : 1;
                 break;
@@ -314,11 +333,16 @@ std::vector<Defect> detect_q_defects(
 
     const DefectDetectParams& dd = params.defect_detection;
     double v_tol = dd.vertical_angle_tol_deg > 0 ? dd.vertical_angle_tol_deg : 10.0;
-    double h_tol = v_tol;
+    // Python allowed_pair_lines 的 h_tol：HORIZONTAL_ANGLE_TOL_DEG 缺省回退 v_tol
+    double h_tol = dd.horizontal_angle_tol_deg > 0 ? dd.horizontal_angle_tol_deg : v_tol;
     int roi_w = roi_gray.cols, roi_h = roi_gray.rows;
 
     // ---- 1. 主体聚类 + allowed_pair_lines（每主体最长 1V + 1H）----
-    auto labels = build_clusters(true_edges, v_tol, roi_w);
+    double cluster_gap_px = params.line_merging.glass_cluster_gap_mm > 0
+        ? params.line_merging.glass_cluster_gap_mm * px_per_mm
+        : (double)params.line_merging.glass_cluster_gap_px;
+    double eff_gap_px = cluster_gap_px > 0 ? cluster_gap_px : 0.08 * (double)roi_w;
+    auto labels = build_clusters(true_edges, v_tol, roi_w, eff_gap_px);
     std::map<int, std::pair<int, double>> best_v, best_h; // idx -> (edge_idx, len)
     for (size_t i = 0; i < true_edges.size(); i++) {
         int cid = labels[i];
@@ -372,11 +396,27 @@ std::vector<Defect> detect_q_defects(
     cv::Point2d cnt_center;
     cv::Mat edges_qc_dil = extract_glass_contour(roi_gray, params, cnt_pts, cnt_center);
 
+    // 各 cluster 中心 = 该 cluster 内主边中点质心（镜像 Python cluster_centers）
+    std::map<int, cv::Point2d> cluster_centers;
+    {
+        struct Acc { double sx = 0, sy = 0; int n = 0; };
+        std::map<int, Acc> acc;
+        for (size_t i = 0; i < true_edges.size(); i++) {
+            int cid = labels[i];
+            acc[cid].sx += (true_edges[i].line[0] + true_edges[i].line[2]) * 0.5;
+            acc[cid].sy += (true_edges[i].line[1] + true_edges[i].line[3]) * 0.5;
+            acc[cid].n += 1;
+        }
+        for (auto& [cid, a] : acc)
+            cluster_centers[cid] = cv::Point2d(a.sx / a.n, a.sy / a.n);
+    }
+
     // ---- 4. 逐角点 Q 三角形判定 ----
     double min_corner_dist = dd.q_corner_contour_min_dist_px > 0 ? dd.q_corner_contour_min_dist_px : 16.0;
-    double min_side_mm = dd.min_width_mm > 0 ? dd.min_width_mm : 5.0;      // 宽 >= 5mm
-    double min_area_mm2 = 25.0;                                             // 面积 >= 25mm2
+    double min_side_mm = 5.0;      // Python corner_contour 块硬编码宽 >= 5mm（非 MIN_WIDTH_MM）
+    double min_area_mm2 = 25.0;    // 面积 >= 25mm2（硬编码）
     double min_hit_dist_px = 5.0 * px_per_mm;                               // 命中点距角点 >= 5mm
+    double q_max_side_mm = dd.q_max_side_mm;                                 // <=0 不限制
 
     struct QCand {
         Defect d;
@@ -418,20 +458,30 @@ std::vector<Defect> detect_q_defects(
                 }
             }
             if (!cands_ray.empty()) {
-                // 优先选择指向主体中心的候选，否则最短 t
-                cv::Point2d inward = cnt_center - cp;
-                double in_norm = std::hypot(inward.x, inward.y);
-                bool has_inward = false;
-                double best_dot = -1e18; size_t best_k = 0;
+                // 镜像 Python：优先“指向本主体(cluster)中心”的候选；否则退回最短 t。
+                // 注意 Python 在向内候选中按 t 升序取最小，而不是取点积最大者。
+                cv::Point2d inward_ref = cnt_center - cp;
+                auto itc = cluster_centers.find(labels[c.i]);
+                if (itc != cluster_centers.end()) inward_ref = itc->second - cp;
+                double in_norm = std::hypot(inward_ref.x, inward_ref.y);
+                size_t best_k = 0;
                 if (in_norm > 1e-6) {
-                    cv::Point2d in_dir(inward.x / in_norm, inward.y / in_norm);
+                    cv::Point2d in_dir(inward_ref.x / in_norm, inward_ref.y / in_norm);
+                    // 收集点积 > 0 的向内候选
+                    std::vector<size_t> inward_ks;
                     for (size_t k = 0; k < cands_ray.size(); k++) {
                         double dot = cands_ray[k].dir.x * in_dir.x + cands_ray[k].dir.y * in_dir.y;
-                        if (dot > 0 && dot > best_dot) { best_dot = dot; best_k = k; has_inward = true; }
+                        if (dot > 0.0) inward_ks.push_back(k);
                     }
-                }
-                if (!has_inward) {
-                    best_k = 0;
+                    if (!inward_ks.empty()) {
+                        best_k = inward_ks[0];
+                        for (size_t k : inward_ks)
+                            if (cands_ray[k].t < cands_ray[best_k].t) best_k = k;
+                    } else {
+                        for (size_t k = 1; k < cands_ray.size(); k++)
+                            if (cands_ray[k].t < cands_ray[best_k].t) best_k = k;
+                    }
+                } else {
                     for (size_t k = 1; k < cands_ray.size(); k++)
                         if (cands_ray[k].t < cands_ray[best_k].t) best_k = k;
                 }
@@ -474,22 +524,36 @@ std::vector<Defect> detect_q_defects(
             double width_mm = std::min(r.size.width, r.size.height) / px_per_mm;
             double length_mm = std::max(r.size.width, r.size.height) / px_per_mm;
             double area_mm2 = (r.size.width * r.size.height) / (px_per_mm * px_per_mm);
-            if (width_mm >= min_side_mm && area_mm2 >= min_area_mm2) {
+            bool max_side_ok = (q_max_side_mm <= 0.0) ||
+                (length_mm <= q_max_side_mm && width_mm <= q_max_side_mm);
+#ifdef CPP_DEBUG_Q
+            std::cerr << "[Q-TRI] cp=(" << cp.x << "," << cp.y << ") area_px=" << tri_area_px
+                      << " w_mm=" << width_mm << " l_mm=" << length_mm << " area_mm2=" << area_mm2
+                      << " pass=" << (width_mm >= min_side_mm && area_mm2 >= min_area_mm2 && max_side_ok) << std::endl;
+#endif
+            if (width_mm >= min_side_mm && area_mm2 >= min_area_mm2 && max_side_ok) {
                 cv::Point2f box[4];
                 r.points(box);
                 Defect d;
                 d.type = "Q";
-                d.x = (int)std::lround(r.center.x);
-                d.y = (int)std::lround(r.center.y);
+                // Python center=int(round(...))（银行家）；box_points=boxPoints().astype(np.int32)（向零截断）
+                d.x = round_banker(r.center.x);
+                d.y = round_banker(r.center.y);
                 d.width_mm = width_mm;
                 d.length_mm = length_mm;
                 d.size_mm = length_mm;
                 d.angle_deg = 0;
                 d.confidence = 0.8;
-                d.pixel_area = (int)std::lround(tri_area_px);
-                for (auto& p : box) d.box_points.push_back(cv::Point((int)std::lround(p.x), (int)std::lround(p.y)));
+                d.pixel_area = round_banker(tri_area_px);
+                for (auto& p : box) d.box_points.push_back(cv::Point((int)p.x, (int)p.y));
                 d.region_contour = tri;
-                d.ray_segments = {{tri[0], tri[1]}, {tri[0], tri[2]}};
+                // Python ray_hits_dbg：cp 用 tuple(map(int, cp)) 截断，命中点用 int(round(...))
+                d.ray_segments = {
+                    {cv::Point((int)cp.x, (int)cp.y),
+                     cv::Point(round_banker(hits[0].x), round_banker(hits[0].y))},
+                    {cv::Point((int)cp.x, (int)cp.y),
+                     cv::Point(round_banker(hits[1].x), round_banker(hits[1].y))}
+                };
                 QCand qc;
                 qc.d = d;
                 qc.tri_area = tri_area_px;
@@ -511,24 +575,25 @@ std::vector<Defect> detect_q_defects(
             double vlen = std::hypot(vv.x, vv.y);
             if (vlen < 1e-6) continue;
             cv::Point2d v_dir(vv.x / vlen, vv.y / vlen);
-            // 按竖直方向上下半区平均亮度选暗侧端点
+            // 半区平均亮度（镜像 Python 3577-3605）：全图逐像素 dot 掩膜，
+            // mask_up = dot>0，mask_dn = dot<0（dot==0 不参与），取更暗侧端点。
             cv::Point2d v_clip;
             double t1 = (vm_p1.x - cp.x) * v_dir.x + (vm_p1.y - cp.y) * v_dir.y;
             double t2 = (vm_p2.x - cp.x) * v_dir.x + (vm_p2.y - cp.y) * v_dir.y;
             cv::Point2d v_up = t1 >= t2 ? vm_p1 : vm_p2;
             cv::Point2d v_dn = (t1 >= t2) ? vm_p2 : vm_p1;
-            // 半区平均亮度（简化：以 cp 为界沿 v_dir 划分）
-            double sum_up = 0, sum_dn = 0; int cnt_up = 0, cnt_dn = 0;
-            int step = std::max(1, roi_h / 60);
-            for (int yy = 0; yy < roi_h; yy += step) {
-                for (int xx = 0; xx < roi_w; xx += step) {
-                    double dot = (xx - cp.x) * v_dir.x + (yy - cp.y) * v_dir.y;
-                    if (dot > 0) { sum_up += roi_gray.at<uchar>(yy, xx); cnt_up++; }
-                    else { sum_dn += roi_gray.at<uchar>(yy, xx); cnt_dn++; }
+            double sum_up = 0, sum_dn = 0; long long cnt_up = 0, cnt_dn = 0;
+            for (int yy = 0; yy < roi_h; yy++) {
+                const uchar* row = roi_gray.ptr<uchar>(yy);
+                double dy = (double)yy - cp.y;
+                for (int xx = 0; xx < roi_w; xx++) {
+                    double dot = ((double)xx - cp.x) * v_dir.x + dy * v_dir.y;
+                    if (dot > 0.0) { sum_up += row[xx]; cnt_up++; }
+                    else if (dot < 0.0) { sum_dn += row[xx]; cnt_dn++; }
                 }
             }
             if (cnt_up > 0 && cnt_dn > 0) {
-                v_clip = (sum_up / cnt_up < sum_dn / cnt_dn) ? v_up : v_dn;
+                v_clip = (sum_up / (double)cnt_up < sum_dn / (double)cnt_dn) ? v_up : v_dn;
             } else {
                 v_clip = v_up;
             }
@@ -541,21 +606,27 @@ std::vector<Defect> detect_q_defects(
             double width_mm = std::min(r.size.width, r.size.height) / px_per_mm;
             double length_mm = std::max(r.size.width, r.size.height) / px_per_mm;
             double area_mm2 = (r.size.width * r.size.height) / (px_per_mm * px_per_mm);
-            if (width_mm >= min_side_mm && area_mm2 >= min_area_mm2) {
+            bool max_side_ok = (q_max_side_mm <= 0.0) ||
+                (length_mm <= q_max_side_mm && width_mm <= q_max_side_mm);
+            if (width_mm >= min_side_mm && area_mm2 >= min_area_mm2 && max_side_ok) {
                 cv::Point2f box[4];
                 r.points(box);
                 Defect d;
                 d.type = "Q";
-                d.x = (int)std::lround(r.center.x);
-                d.y = (int)std::lround(r.center.y);
+                // 与双边分支一致：center 银行家、box_points 截断（镜像 Python）
+                d.x = round_banker(r.center.x);
+                d.y = round_banker(r.center.y);
                 d.width_mm = width_mm;
                 d.length_mm = length_mm;
                 d.size_mm = length_mm;
                 d.confidence = 0.75;
-                d.pixel_area = (int)std::lround(tri_area_px);
-                for (auto& p : box) d.box_points.push_back(cv::Point((int)std::lround(p.x), (int)std::lround(p.y)));
+                d.pixel_area = round_banker(tri_area_px);
+                for (auto& p : box) d.box_points.push_back(cv::Point((int)p.x, (int)p.y));
                 d.region_contour = tri;
-                d.ray_segments = {{tri[0], tri[1]}};
+                d.ray_segments = {
+                    {cv::Point((int)cp.x, (int)cp.y),
+                     cv::Point(round_banker(pt_hit.x), round_banker(pt_hit.y))}
+                };
                 QCand qc;
                 qc.d = d;
                 qc.tri_area = tri_area_px;
@@ -565,8 +636,8 @@ std::vector<Defect> detect_q_defects(
         }
     }
 
-    // ---- 5. 去重：中心距离 <= 12px 保留三角形面积大者 ----
-    const double dedup_dist = 12.0;
+    // ---- 5. 去重：中心距离 <= Q_DEDUP_CENTER_DIST_PX 保留三角形面积大者 ----
+    const double dedup_dist = dd.q_dedup_center_dist_px > 0 ? dd.q_dedup_center_dist_px : 12.0;
     std::vector<QCand> dedup;
     for (auto& qc : cands) {
         bool picked = false;

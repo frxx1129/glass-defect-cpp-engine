@@ -1,4 +1,4 @@
-﻿#include "engine/preprocess.h"
+#include "engine/preprocess.h"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 
@@ -24,6 +24,14 @@ static cv::Mat canny_once(const cv::Mat& contrast, double low, double high) {
     return edges;
 }
 
+// 银行家舍入（镜像 Python round：.5 取偶数）
+static int round_banker(double x) {
+    double r = std::floor(x);
+    double frac = x - r;
+    if (frac > 0.5 || (frac == 0.5 && std::fmod(r, 2.0) != 0.0)) r += 1.0;
+    return (int)r;
+}
+
 cv::Mat preprocess_for_defect_edges(const cv::Mat& gray, const PreprocessParams& p) {
     cv::Mat contrast = enhance_contrast(gray, p);
     return canny_once(contrast, p.canny_low, p.canny_high);
@@ -40,10 +48,11 @@ cv::Mat preprocess_for_hough_enhanced(const cv::Mat& gray, const PreprocessParam
         edge_ratio = static_cast<double>(non_zero) / static_cast<double>(edges.total());
     }
     if (edge_ratio < p.hough_min_edge_ratio) {
-        // 1) 降阈值补跑
+        // 1) 降阈值补跑：Python 用 int(max(0, round(low*scale))) —— round 为银行家舍入，
+        //    不能用 C++ 截断（如 high=90*0.75=67.5 → Python 68，截断得 67）。
         double scale = p.hough_canny_fallback_scale;
-        double low2 = std::max(0.0, p.canny_low * scale);
-        double high2 = std::max(low2 + 1.0, p.canny_high * scale);
+        double low2 = std::max(0.0, (double)round_banker(p.canny_low * scale));
+        double high2 = std::max(low2 + 1.0, (double)round_banker(p.canny_high * scale));
         cv::Mat edges2 = canny_once(contrast, low2, high2);
         cv::bitwise_or(edges, edges2, edges);
 

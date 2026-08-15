@@ -67,7 +67,8 @@ struct EarlyCluster {
 EarlyCluster build_early_cluster(const std::vector<cv::Vec4i>& lines, const LineMergingParams& lm,
                                  double px_per_mm) {
     EarlyCluster ec;
-    double cluster_gap_px = 40.0 * px_per_mm; // GLASS_CLUSTER_GAP_MM 默认 40
+    double cluster_gap_px = lm.glass_cluster_gap_mm > 0
+        ? lm.glass_cluster_gap_mm * px_per_mm : (double)lm.glass_cluster_gap_px;
     if (cluster_gap_px <= 0 || lines.size() < 4) return ec;
     std::vector<double> mids;
     for (auto& l : lines) mids.push_back((l[0] + l[2]) * 0.5);
@@ -312,15 +313,25 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
     const LineMergingParams& p = params.line_merging;
     const DefectDetectParams& dd = params.defect_detection;
     double v_tol = dd.vertical_angle_tol_deg > 0 ? dd.vertical_angle_tol_deg : 10.0;
-    double h_tol = v_tol;
+    // Python merge_lines_and_get_main_edges：h_tol = HORIZONTAL_ANGLE_TOL_DEG（缺省回退 v_tol）
+    double h_tol = dd.horizontal_angle_tol_deg > 0 ? dd.horizontal_angle_tol_deg : v_tol;
 
     double vertical_thick_merge_px = p.vertical_thick_merge_mm * px_per_mm;
     double vertical_thick_merge_cap_px = p.vertical_thick_merge_max_mm * px_per_mm;
     double vertical_max_ax_gap_px = 20.0 * px_per_mm; // VERTICAL_MAX_AXIAL_GAP_MM 默认 20
-    double max_lat_dist_px = std::min(p.max_lateral_distance_mm * px_per_mm,
-                                      (double)p.max_lateral_distance);
+    // Python：MM 键存在则只用 MM*ppm；否则用 PX；均无默认按调用点（此处生产 config 都有 MM）
+    double max_lat_dist_px = p.max_lateral_distance_mm > 0
+        ? p.max_lateral_distance_mm * px_per_mm : (double)p.max_lateral_distance;
     double min_vertical_gap_px = p.min_vertical_edge_gap_px;
+    double merged_min_support_px = p.merged_min_support_mm > 0
+        ? p.merged_min_support_mm * px_per_mm : (double)p.merged_min_support_px;
+    double cluster_gap_px = p.glass_cluster_gap_mm > 0
+        ? p.glass_cluster_gap_mm * px_per_mm : (double)p.glass_cluster_gap_px;
+    // Python canny_gap_blocks_merge 用 Q_CANNY_STRIPE_HALF_WIDTH_PX，默认 2
     double stripe_half = std::max(1.0, (double)dd.q_canny_stripe_half_width_px);
+    int canny_refine_half_px = p.canny_axis_refine_half_px;
+    double vertical_thick_merge_scale = p.vertical_thick_merge_scale > 0
+        ? p.vertical_thick_merge_scale : 1.5;
 
     EarlyCluster ec = build_early_cluster(lines, p, px_per_mm);
 
@@ -423,7 +434,7 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                 double x_med = true_median(xs);
                 for (double x : xs) devs.push_back(std::abs(x - x_med));
                 std::sort(devs.begin(), devs.end());
-                double x_mad = devs[devs.size() / 2] * 2.0;
+                double x_mad = true_median(devs) * 2.0;
                 double y_min = *std::min_element(ys.begin(), ys.end());
                 double y_max = *std::max_element(ys.begin(), ys.end());
                 return std::make_tuple(x_med, x_mad, y_min, y_max);
@@ -440,7 +451,8 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                     if (used[j]) continue;
                     auto [xj, xj_mad, yj0, yj1] = group_stats(proximity_groups[j]);
                     if (ec.active && early_cluster_id(ec, xi) != early_cluster_id(ec, xj)) continue;
-                    double dyn_allow = std::max(vertical_thick_merge_px, 1.5 * (xi_mad + xj_mad));
+                    double dyn_allow = std::max(vertical_thick_merge_px,
+                                                vertical_thick_merge_scale * (xi_mad + xj_mad));
                     if (vertical_thick_merge_cap_px > 0) dyn_allow = std::min(dyn_allow, vertical_thick_merge_cap_px);
 #ifdef CPP_DEBUG_MERGED
                     std::cerr << "  [VTHICK] xi=" << xi << " xj=" << xj << " dyn=" << dyn_allow
@@ -476,7 +488,6 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
     }
 
     // ===== 每组：fitLine + 投影端点 + 轴向锁定 =====
-    const double canny_refine_half_px = 3.0;
     for (auto& angle_groups : final_groups) {
         for (auto& group : angle_groups) {
             if (group.empty()) continue;
@@ -511,7 +522,7 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
             // 轴向锁定：利用 Canny 边缘图稳定位置
             if (!edge_img.empty()) {
                 int h_img = edge_img.rows, w_img = edge_img.cols;
-                if (nv) {
+                if (nv && p.vertical_lock_axis) {
                     // 镜像 Python：y 范围用原始点的 min/max（不能用投影端点 p_min/p_max，
                     // 否则 fitLine 方向符号翻转时 y0>y1 导致锁定失效）
                     double pts_min_y = 1e18, pts_max_y = -1e18;
@@ -534,7 +545,7 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                         if (col_sum > best_sum) { best_sum = col_sum; cx_best = cx; }
                     }
                     final_line = cv::Vec4d(cx_best, y0s, cx_best, y1s);
-                } else if (nh) {
+                } else if (nh && p.horizontal_lock_axis) {
                     // 镜像 Python：x 范围用原始点的 min/max
                     double pts_min_x = 1e18, pts_max_x = -1e18;
                     for (auto& pt : pts) {
@@ -581,7 +592,7 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
 
                     // 水平连接性校验（镜像 Python HORIZONTAL_CONNECTIVITY）：
                     // group 内线段按 x 投影排序，相邻段 gap>=8px 且 Canny 无边缘连续>=25px -> 拆回最长段
-                    if (group.size() >= 2) {
+                    if (group.size() >= 2 && p.horizontal_connectivity_enable) {
                         struct XSeg { double a, b; cv::Vec4i ln; };
                         std::vector<XSeg> segs_proj;
                         for (auto& ln : group) {
@@ -591,9 +602,9 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                         }
                         std::sort(segs_proj.begin(), segs_proj.end(),
                                   [](const XSeg& u, const XSeg& v) { return u.a < v.a; });
-                        const double gap_min_px = 8.0;
-                        const double gap_no_edge_allow = 25.0;
-                        const int stripe_half = 2;
+                        const double gap_min_px = p.horiz_connect_min_gap_px;
+                        const double gap_no_edge_allow = p.horiz_connect_max_no_edge_run_px;
+                        const int stripe_half_hc = std::max(1, p.horiz_connect_stripe_half_px);
                         bool connectivity_ok = true;
                         for (size_t k = 0; k + 1 < segs_proj.size() && connectivity_ok; k++) {
                             double a1 = segs_proj[k].b;
@@ -605,10 +616,10 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                             for (int s = 0; s <= steps; s++) {
                                 double xpos = a1 + gap_len * (double)s / std::max(1, steps);
                                 int cx = (int)std::lround(xpos);
-                                int xa = std::max(0, cx - stripe_half);
-                                int xb = std::min(w_img - 1, cx + stripe_half);
-                                int ya = std::max(0, cy_best - stripe_half);
-                                int yb = std::min(h_img - 1, cy_best + stripe_half);
+                                int xa = std::max(0, cx - stripe_half_hc);
+                                int xb = std::min(w_img - 1, cx + stripe_half_hc);
+                                int ya = std::max(0, cy_best - stripe_half_hc);
+                                int yb = std::min(h_img - 1, cy_best + stripe_half_hc);
                                 bool hit = false;
                                 if (xa <= xb && ya <= yb) {
                                     for (int yy = ya; yy <= yb && !hit; yy++)
@@ -664,6 +675,8 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
             // 用于排序与 ENSURE_VERTICAL_PER_CLUSTER 强度比较；不是点数。
             double support_score = 0.0;
             for (auto& ln : group) support_score += line_length_px(ln);
+            // Python merged_min_support 过滤（默认 5mm），低于阈值的候选不进入后续 topN/去重
+            if (merged_min_support_px > 0.0 && support_score < merged_min_support_px) continue;
             ml.support = (int)std::lround(support_score);
             ml.near_vertical = is_near_vertical(ml.angle_deg, v_tol);
             ml.near_horizontal = is_near_horizontal(ml.angle_deg, h_tol);
@@ -676,18 +689,250 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
         }
     }
 
-    // 按 support（=组内长度之和，镜像 Python score）排序取 top_n
-    std::vector<MergedLine> all_lines = result; // topN 前全部候选（镜像 Python filtered）
+    // ===== 支持度排序（镜像 Python merged_lines_with_scores.sort） =====
     std::sort(result.begin(), result.end(),
               [](const MergedLine& a, const MergedLine& b) { return a.support > b.support; });
+
+    auto x_center_d = [](const cv::Vec4d& s) { return 0.5 * (s[0] + s[2]); };
+    auto y_span_d = [](const cv::Vec4d& s) -> std::pair<double, double> {
+        return {std::min(s[1], s[3]), std::max(s[1], s[3])};
+    };
+
+    // ===== 竖直线“跨角度簇”二次合并（镜像 Python 1679-1790） =====
+    // ⚠️ Python 本地基准中该块为死代码：块内调用的 _angle_deg 定义在块之后（1803 行），
+    // 执行时 NameError 被外层 except: pass 吞掉，因此该功能从未实际运行。
+    // 为与本地验证基准的**可观测行为**一致，C++ 暂不启用；上游修复该前向引用后再打开。
+    const bool vertical_across_angle_actually_runs_in_python = false;
+    if (vertical_across_angle_actually_runs_in_python &&
+        p.vertical_across_angle_merge_enable && vertical_thick_merge_px > 0 && !result.empty()) {
+        double v_merge_min_overlap_ratio = p.vertical_thick_min_overlap_ratio > 0
+            ? p.vertical_thick_min_overlap_ratio : 0.2;
+        std::vector<MergedLine> vertical_items, other_items;
+        for (auto& ml : result) {
+            if (ml.near_vertical) vertical_items.push_back(ml);
+            else other_items.push_back(ml);
+        }
+        // 按 (early_cluster_id, x_center) 排序后扫描合并
+        std::sort(vertical_items.begin(), vertical_items.end(),
+                  [&](const MergedLine& a, const MergedLine& b) {
+                      int ca = early_cluster_id(ec, x_center_d(a.line));
+                      int cb = early_cluster_id(ec, x_center_d(b.line));
+                      if (ca != cb) return ca < cb;
+                      return x_center_d(a.line) < x_center_d(b.line);
+                  });
+
+        struct VGroup {
+            int cluster = 0;
+            std::vector<MergedLine> lines;
+            double x_rep = 0.0, y0 = 0.0, y1 = 0.0;
+        };
+        std::vector<VGroup> groups;
+
+        auto finalize_group = [](const VGroup& g) -> MergedLine {
+            MergedLine out;
+            std::vector<double> xs;
+            for (auto& l : g.lines) xs.push_back(0.5 * (l.line[0] + l.line[2]));
+            double w = 0.0;
+            for (auto& l : g.lines) w += (double)l.support;
+            double x_new = 0.0;
+            if (w <= 1e-6) {
+                std::sort(xs.begin(), xs.end());
+                x_new = true_median(xs);
+            } else {
+                double sum = 0.0;
+                for (size_t k = 0; k < g.lines.size(); k++)
+                    sum += 0.5 * (g.lines[k].line[0] + g.lines[k].line[2]) * (double)g.lines[k].support;
+                x_new = sum / w;
+            }
+            out.line = cv::Vec4d(x_new, g.y0, x_new, g.y1);
+            out.angle_deg = line_angle_deg(out.line);
+            out.length_px = g.y1 - g.y0;
+            double sc = 0.0;
+            for (auto& l : g.lines) sc += (double)l.support;
+            out.support = (int)std::lround(sc);
+            out.near_vertical = true;
+            out.near_horizontal = false;
+            return out;
+        };
+        auto overlap_ratio = [](double a0, double a1, double b0, double b1) {
+            double overlap = std::max(0.0, std::min(a1, b1) - std::max(a0, b0));
+            double span = std::max(1.0, std::max(a1, b1) - std::min(a0, b0));
+            return overlap / span;
+        };
+
+        for (auto& ml : vertical_items) {
+            double x_c = x_center_d(ml.line);
+            auto [y0, y1] = y_span_d(ml.line);
+            int cid = early_cluster_id(ec, x_c);
+            if (groups.empty() || groups.back().cluster != cid) {
+                VGroup g; g.cluster = cid; g.lines.push_back(ml);
+                g.x_rep = x_c; g.y0 = y0; g.y1 = y1;
+                groups.push_back(std::move(g));
+                continue;
+            }
+            VGroup& cur = groups.back();
+            // 组内 x 中心 MAD 厚度（含候选点）
+            std::vector<double> xs_group;
+            for (auto& l : cur.lines) xs_group.push_back(x_center_d(l.line));
+            xs_group.push_back(x_c);
+            std::sort(xs_group.begin(), xs_group.end());
+            double med = true_median(xs_group);
+            std::vector<double> devs;
+            for (double v : xs_group) devs.push_back(std::abs(v - med));
+            std::sort(devs.begin(), devs.end());
+            double x_mad = true_median(devs) * 2.0;
+            double dyn_lat_allow = std::max(vertical_thick_merge_px, vertical_thick_merge_scale * x_mad);
+            if (vertical_thick_merge_cap_px > 0) dyn_lat_allow = std::min(dyn_lat_allow, vertical_thick_merge_cap_px);
+            if (std::abs(x_c - cur.x_rep) <= dyn_lat_allow &&
+                overlap_ratio(cur.y0, cur.y1, y0, y1) >= v_merge_min_overlap_ratio) {
+                cur.lines.push_back(ml);
+                std::sort(xs_group.begin(), xs_group.end());
+                cur.x_rep = true_median(xs_group);
+                cur.y0 = std::min(cur.y0, y0);
+                cur.y1 = std::max(cur.y1, y1);
+            } else {
+                // 落地当前组（保存最终化结果），再开启新组
+                VGroup done_g;
+                done_g.cluster = cur.cluster;
+                done_g.lines.push_back(finalize_group(cur));
+                groups.push_back(done_g);
+                VGroup g; g.cluster = cid; g.lines.push_back(ml);
+                g.x_rep = x_c; g.y0 = y0; g.y1 = y1;
+                groups.push_back(std::move(g));
+            }
+        }
+        std::vector<MergedLine> merged_vertical;
+        for (auto& g : groups) {
+            // Python _finalize_group 对每组（含单元素组）都归一化为竖直段
+            merged_vertical.push_back(finalize_group(g));
+        }
+        result.clear();
+        for (auto& it : other_items) result.push_back(it);
+        for (auto& it : merged_vertical) result.push_back(it);
+        std::sort(result.begin(), result.end(),
+                  [](const MergedLine& a, const MergedLine& b) { return a.support > b.support; });
+    }
+
+    // ===== 重复/重合线段去重（镜像 Python 1793-1890） =====
+    {
+        double dup_offset_px = p.duplicate_merge_max_offset_px;
+        double dup_angle_tol_deg = p.duplicate_merge_angle_tol_deg;
+        double horiz_dup_max_off_px = p.horizontal_dup_merge_max_offset_mm > 0
+            ? p.horizontal_dup_merge_max_offset_mm * px_per_mm
+            : p.horizontal_dup_merge_max_offset_px;
+        double horiz_dup_min_overlap_ratio = p.horizontal_dup_min_overlap_ratio;
+
+        auto perp_dist_line = [](const cv::Point2d& p, const cv::Vec4d& l) {
+            double dx = l[2] - l[0], dy = l[3] - l[1];
+            double len = std::hypot(dx, dy);
+            if (len < 1e-6) return std::hypot(p.x - l[0], p.y - l[1]);
+            return std::abs(dx * (l[1] - p.y) - dy * (l[0] - p.x)) / len;
+        };
+        auto pt_dist_seg_clamped = [](const cv::Point2d& p, const cv::Vec4d& l) {
+            double vx = l[2] - l[0], vy = l[3] - l[1];
+            double lv = vx * vx + vy * vy;
+            if (lv < 1e-6) return std::hypot(p.x - l[0], p.y - l[1]);
+            double t = ((p.x - l[0]) * vx + (p.y - l[1]) * vy) / lv;
+            t = std::max(0.0, std::min(1.0, t));
+            return std::hypot(p.x - (l[0] + t * vx), p.y - (l[1] + t * vy));
+        };
+        auto x_proj_overlap_ratio = [](double a0, double a1, double b0, double b1) {
+            double overlap = std::max(0.0, std::min(a1, b1) - std::max(a0, b0));
+            double span = std::max(1.0, std::max(a1, b1) - std::min(a0, b0));
+            return overlap / span;
+        };
+
+        std::vector<MergedLine> filtered;
+        for (auto& item : result) {
+            const cv::Vec4d& seg = item.line;
+            double ang = line_angle_deg(seg);
+            bool keep = true;
+            double sx1 = seg[0], sy1 = seg[1], sx2 = seg[2], sy2 = seg[3];
+            for (auto& kept : filtered) {
+                const cv::Vec4d& kseg = kept.line;
+                double kang = line_angle_deg(kseg);
+                double ang_diff = std::min(std::abs(ang - kang), 180.0 - std::abs(ang - kang));
+                if (ang_diff > dup_angle_tol_deg) continue;
+                // 近水平重复：垂距小且 x 投影重叠足够
+                if (is_near_horizontal(ang, h_tol) && is_near_horizontal(kang, h_tol)) {
+                    double d_perp = std::min(perp_dist_line(cv::Point2d(sx1, sy1), kseg),
+                                             perp_dist_line(cv::Point2d(sx2, sy2), kseg));
+                    if (d_perp <= horiz_dup_max_off_px) {
+                        double sx_min = std::min(sx1, sx2), sx_max = std::max(sx1, sx2);
+                        double kx_min = std::min(kseg[0], kseg[2]), kx_max = std::max(kseg[0], kseg[2]);
+                        if (x_proj_overlap_ratio(sx_min, sx_max, kx_min, kx_max) >= horiz_dup_min_overlap_ratio) {
+                            keep = false;
+                            break;
+                        }
+                    }
+                }
+                // 通用重合：候选两端点到已保留线段（夹紧投影）距离均 <= 容差
+                double d1 = pt_dist_seg_clamped(cv::Point2d(sx1, sy1), kseg);
+                double d2 = pt_dist_seg_clamped(cv::Point2d(sx2, sy2), kseg);
+                if (d1 <= dup_offset_px && d2 <= dup_offset_px) {
+                    keep = false;
+                    break;
+                }
+            }
+            if (keep) filtered.push_back(item);
+        }
+        std::sort(filtered.begin(), filtered.end(),
+                  [](const MergedLine& a, const MergedLine& b) { return a.support > b.support; });
+
+        // ===== 近竖直过近合并（镜像 Python MIN_VERTICAL_EDGE_GAP_PX，1903-1925） =====
+        if (min_vertical_gap_px > 0.0 && !filtered.empty()) {
+            std::vector<MergedLine> filtered_with_gap;
+            for (auto& item : filtered) {
+                if (!item.near_vertical) { filtered_with_gap.push_back(item); continue; }
+                double x_center = x_center_d(item.line);
+                bool merged = false;
+                for (auto& existing : filtered_with_gap) {
+                    if (!existing.near_vertical) continue;
+                    double ex_center = x_center_d(existing.line);
+                    if (std::abs(x_center - ex_center) < min_vertical_gap_px) {
+                        double w = std::max(1e-6, (double)item.support + (double)existing.support);
+                        double x_new = (x_center * (double)item.support +
+                                        ex_center * (double)existing.support) / w;
+                        auto [y0a, y1a] = y_span_d(item.line);
+                        auto [y0b, y1b] = y_span_d(existing.line);
+                        existing.line = cv::Vec4d(x_new, std::min(y0a, y0b), x_new, std::max(y1a, y1b));
+                        existing.support += item.support;
+                        existing.length_px = std::max(y1a, y1b) - std::min(y0a, y0b);
+                        existing.angle_deg = line_angle_deg(existing.line);
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged) filtered_with_gap.push_back(item);
+            }
+            filtered = filtered_with_gap;
+        }
+        result = filtered;
+    }
+
+    // topN 前全部候选（镜像 Python filtered）
+    std::vector<MergedLine> all_lines = result;
     if ((int)result.size() > p.top_n_edges) result.resize(p.top_n_edges);
+
+    // ===== ENSURE_VERTICAL_PRESENCE（Python 默认 False） =====
+    if (p.ensure_vertical_presence && !result.empty() && !all_lines.empty()) {
+        bool any_vertical = false;
+        for (auto& e : result) if (e.near_vertical) { any_vertical = true; break; }
+        if (!any_vertical) {
+            for (auto& ml : all_lines) {
+                if (!ml.near_vertical) continue;
+                bool in_edges = false;
+                for (auto& e : result) if (e.line == ml.line) { in_edges = true; break; }
+                if (!in_edges) { result.back() = ml; break; }
+            }
+        }
+    }
 
     // ===== 多玻璃/多主体：每个 cluster 至少保留一条近竖直主边（镜像 Python ENSURE_VERTICAL_PER_CLUSTER，1961-2055）=====
     // 当全部候选按 x 中点存在大间隙（>= GLASS_CLUSTER_GAP_MM）时划分左右两 cluster；
     // 若某 cluster 的 top_n 内没有竖直主边，则用该 cluster 候选集中最强的竖直边替换其最弱的非竖直边。
     // 典型场景：多玻璃 ROI 中右侧玻璃只有斜边噪声进入 top_n，缺少竖直主边 → E 误报。
     if (p.ensure_vertical_per_cluster && !all_lines.empty() && !result.empty()) {
-        double cluster_gap_px = 40.0 * px_per_mm; // GLASS_CLUSTER_GAP_MM 默认 40
         if (cluster_gap_px > 0 && (int)all_lines.size() >= 4) {
             std::vector<double> mids;
             for (auto& ml : all_lines) mids.push_back((ml.line[0] + ml.line[2]) * 0.5);
@@ -753,6 +998,75 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
             const double ortho_extend = 30.0 * px_per_mm;    // INTERSECTION_ORTHO_EXTEND_MM
             const double ortho_accept_deg = 60.0;
 
+            // 多主体聚类标签（镜像 Python 2086-2147）：
+            // 优先近竖直边 x 中点最大间隙；否则 X/Y 中点最大间隙；靠近阈值的竖直边为 seam(-1)
+            std::vector<int> labels(m, 0);
+            double x_thresh = 0.0;
+            bool has_x_thresh = false;
+            auto ang_abs_local = [](const cv::Vec4d& s) {
+                double a = std::abs(std::atan2(s[3] - s[1], s[2] - s[0]) * 180.0 / CV_PI);
+                return a <= 90.0 ? a : 180.0 - a;
+            };
+            auto is_vert_local = [&](const cv::Vec4d& s) { return ang_abs_local(s) >= (90.0 - v_tol); };
+            if (m >= 4 && cluster_gap_px > 0) {
+                std::vector<std::pair<double, int>> xs;
+                for (int i = 0; i < m; i++)
+                    if (is_vert_local(result[i].line))
+                        xs.push_back({0.5 * (result[i].line[0] + result[i].line[2]), i});
+                if (xs.size() >= 2) {
+                    std::sort(xs.begin(), xs.end());
+                    double max_gap = -1.0; int k = -1;
+                    for (size_t i = 0; i + 1 < xs.size(); i++) {
+                        double g = xs[i + 1].first - xs[i].first;
+                        if (g > max_gap) { max_gap = g; k = (int)i; }
+                    }
+                    if (k >= 0 && max_gap >= cluster_gap_px) {
+                        x_thresh = 0.5 * (xs[k].first + xs[k + 1].first);
+                        has_x_thresh = true;
+                    }
+                }
+                if (!has_x_thresh) {
+                    // 回退 X/Y 最大间隙（X 成功才设 x_thresh；Y 只设 labels）
+                    for (int dim = 0; dim < 2 && !has_x_thresh; dim++) {
+                        std::vector<std::pair<double, int>> ord;
+                        for (int i = 0; i < m; i++) {
+                            double v = dim == 0
+                                ? 0.5 * (result[i].line[0] + result[i].line[2])
+                                : 0.5 * (result[i].line[1] + result[i].line[3]);
+                            ord.push_back({v, i});
+                        }
+                        std::sort(ord.begin(), ord.end());
+                        double max_gap = -1.0; int k = -1;
+                        for (size_t i = 0; i + 1 < ord.size(); i++) {
+                            double g = ord[i + 1].first - ord[i].first;
+                            if (g > max_gap) { max_gap = g; k = (int)i; }
+                        }
+                        if (k >= 0 && max_gap >= cluster_gap_px) {
+                            for (size_t i = 0; i < ord.size(); i++)
+                                labels[ord[i].second] = ((int)i <= k) ? 0 : 1;
+                            if (dim == 0) {
+                                x_thresh = 0.5 * (ord[k].first + ord[k + 1].first);
+                                has_x_thresh = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (has_x_thresh) {
+                double seam_margin_px = std::max(extend_margin, 0.15 * cluster_gap_px);
+                for (int i = 0; i < m; i++) {
+                    double mx = 0.5 * (result[i].line[0] + result[i].line[2]);
+                    if (is_vert_local(result[i].line) && std::abs(mx - x_thresh) <= seam_margin_px) {
+                        labels[i] = -1;
+                    } else {
+                        labels[i] = (mx <= x_thresh) ? 0 : 1;
+                    }
+                }
+            }
+            auto cluster_compatible = [&](int i, int j) {
+                return (labels[i] == labels[j]) || labels[i] == -1 || labels[j] == -1;
+            };
+
             struct InterRec { cv::Point2d pt; double t; };
             std::vector<InterRec> best0(m), best1(m);
             std::vector<char> has0(m, 0), has1(m, 0);
@@ -762,6 +1076,8 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                 const cv::Vec4d& li = result[i].line;
                 cv::Point2d ai(li[0], li[1]), bi(li[2], li[3]);
                 for (int j = i + 1; j < m; j++) {
+                    // 多主体：默认不跨组求交；seam(-1) 允许与两侧相交
+                    if (!cluster_compatible(i, j)) continue;
                     const cv::Vec4d& lj = result[j].line;
                     cv::Point2d aj(lj[0], lj[1]), bj(lj[2], lj[3]);
                     cv::Point2d inter;

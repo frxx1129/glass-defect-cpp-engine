@@ -20,6 +20,9 @@ std::vector<Defect> StaticArtifactTracker::filter(
     const std::vector<Defect>& defects,
     const std::string& cam_key)
 {
+    // 镜像 Python filter_static_artifact_defects：无缺陷帧不计数、不推进冷却
+    if (defects.empty()) return defects;
+
     if (!cam_key.empty() && state_.find(cam_key) == state_.end()) {
         CameraState cs;
         cs.total = 0;

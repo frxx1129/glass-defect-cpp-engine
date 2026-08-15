@@ -84,7 +84,7 @@ std::vector<std::vector<cv::Point>> scan_edge_for_luminosity_defects(
     double threshold_low = mean[0] - p.luminosity_std_dev_multiplier * std_val;
     double min_area_px2 = p.luminosity_min_area_mm2 > 0
         ? p.luminosity_min_area_mm2 * px_per_mm * px_per_mm : p.luminosity_min_area;
-    double min_gradient = p.luminosity_min_gradient > 0 ? p.luminosity_min_gradient : 15.0;
+    double min_gradient = p.luminosity_min_gradient; // Python 默认 15（解析层已对齐），0 也按 0
 
     cv::Mat potential;
     cv::compare(roi_gray, threshold_low, potential, cv::CMP_LT);

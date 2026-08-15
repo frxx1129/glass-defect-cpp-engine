@@ -1,7 +1,13 @@
-﻿#include "engine/classify.h"
+#include "engine/classify.h"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+
+// ⚠️ 历史遗留桩：本文件定义的 find_and_analyze_defects 当前**未被任何调用点使用**
+// （grep 全 src 仅此处定义）。实际缺陷分类流程在 detector.cpp::process_roi 内联实现
+// （B 亮度扫描→过滤链→B→L、E、Q、宽度预过滤）。本桩与 Python find_and_analyze_defects
+// 的当前语义不符，保留仅为编译兼容；若将来恢复通用分类入口须按 image_processor_hough.py
+// 4333-4676 重写。
 
 namespace {
 
