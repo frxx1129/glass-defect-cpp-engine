@@ -677,7 +677,7 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
             for (auto& ln : group) support_score += line_length_px(ln);
             // Python merged_min_support 过滤（默认 5mm），低于阈值的候选不进入后续 topN/去重
             if (merged_min_support_px > 0.0 && support_score < merged_min_support_px) continue;
-            ml.support = (int)std::lround(support_score);
+            ml.support = support_score;
             ml.near_vertical = is_near_vertical(ml.angle_deg, v_tol);
             ml.near_horizontal = is_near_horizontal(ml.angle_deg, h_tol);
 #ifdef CPP_DEBUG_MERGED
@@ -749,7 +749,7 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
             out.length_px = g.y1 - g.y0;
             double sc = 0.0;
             for (auto& l : g.lines) sc += (double)l.support;
-            out.support = (int)std::lround(sc);
+            out.support = sc;
             out.near_vertical = true;
             out.near_horizontal = false;
             return out;

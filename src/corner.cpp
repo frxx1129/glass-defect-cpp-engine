@@ -220,6 +220,51 @@ std::vector<int> build_clusters(const std::vector<MergedLine>& edges, double v_t
     return labels;
 }
 
+// Python calculate_angle_between_lines（[0,90] + 90° 邻域修约 _adjust_angle_near_90）
+double angle_between_lines_adjust(const cv::Vec4d& l1, const cv::Vec4d& l2) {
+    double v1x = l1[2] - l1[0], v1y = l1[3] - l1[1];
+    double v2x = l2[2] - l2[0], v2y = l2[3] - l2[1];
+    double m1 = std::hypot(v1x, v1y), m2 = std::hypot(v2x, v2y);
+    if (m1 < 1e-9 || m2 < 1e-9) return 0.0;
+    double cosine = (v1x * v2x + v1y * v2y) / (m1 * m2);
+    cosine = std::max(-1.0, std::min(1.0, cosine));
+    double deg = std::acos(cosine) * 180.0 / CV_PI;
+    if (deg > 90.0) deg = 180.0 - deg;
+    if (deg >= 86.0 && deg <= 94.0) return 90.0;
+    if (deg >= 80.0 && deg <= 100.0) return 90.0 + 0.5 * (deg - 90.0);
+    return deg;
+}
+
+// Python get_line_quadrant + get_quadrant_compatibility（用于 potential_pairs 排序）
+int quadrant_compatibility(const cv::Vec4d& l1, const cv::Vec4d& l2, int w, int h) {
+    auto quadrant = [&](const cv::Vec4d& l) -> int {
+        double mid_x = 0.5 * (l[0] + l[2]);
+        double mid_y = 0.5 * (l[1] + l[3]);
+        if (mid_y < 0.5 * h) return mid_x < 0.5 * w ? 0 : 1;   // TL / TR
+        return mid_x < 0.5 * w ? 2 : 3;                         // BL / BR
+    };
+    int q1 = quadrant(l1), q2 = quadrant(l2);
+    if (q1 == q2) return 0;
+    std::pair<int, int> key(std::min(q1, q2), std::max(q1, q2));
+    if (key == std::pair<int, int>(0, 1) || key == std::pair<int, int>(2, 3) ||
+        key == std::pair<int, int>(0, 2) || key == std::pair<int, int>(1, 3)) return 1;
+    return 2;
+}
+
+// Python _get_dist_px 的 CORNER_MAX_EXTENSION_* 部分：
+// 垂直组合用 perpendicular 键，其余用 normal 键；mm 为 0 时回退像素键/0。
+double max_extension_px(const DefectDetectParams& dd, double angle_between, double px_per_mm) {
+    bool perp = std::abs(angle_between - 90.0) < dd.perpendicular_angle_tolerance;
+    if (perp) {
+        if (dd.corner_max_extension_perp_mm > 0.0)
+            return dd.corner_max_extension_perp_mm * px_per_mm;
+        return (double)dd.corner_max_extension_perp;
+    }
+    if (dd.corner_max_extension_normal_mm > 0.0)
+        return dd.corner_max_extension_normal_mm * px_per_mm;
+    return 0.0;
+}
+
 // 提取玻璃主体轮廓（Python：preprocess_for_defect_edges + 膨胀 + 最大轮廓）
 cv::Mat extract_glass_contour(const cv::Mat& roi_gray, const InspectorParams& params,
                               std::vector<cv::Point>& contour_pts, cv::Point2d& centroid) {
@@ -320,6 +365,141 @@ double min_dist_to_contour(const cv::Point2d& pt, const std::vector<cv::Point>& 
 }
 
 } // namespace
+
+std::vector<cv::Point2d> collect_non_q_intersections(
+    const std::vector<MergedLine>& true_edges,
+    const InspectorParams& params,
+    double px_per_mm,
+    int roi_w,
+    int roi_h)
+{
+    std::vector<cv::Point2d> out;
+    if (true_edges.size() < 2 || roi_w <= 0 || roi_h <= 0) return out;
+
+    const DefectDetectParams& dd = params.defect_detection;
+    double v_tol = dd.vertical_angle_tol_deg > 0 ? dd.vertical_angle_tol_deg : 10.0;
+    double h_tol = dd.horizontal_angle_tol_deg > 0 ? dd.horizontal_angle_tol_deg : v_tol;
+
+    // 主体聚类（与 detect_q_defects 相同）
+    double cluster_gap_px = params.line_merging.glass_cluster_gap_mm > 0
+        ? params.line_merging.glass_cluster_gap_mm * px_per_mm
+        : (double)params.line_merging.glass_cluster_gap_px;
+    double eff_gap_px = cluster_gap_px > 0 ? cluster_gap_px : 0.08 * (double)roi_w;
+    auto labels = build_clusters(true_edges, v_tol, roi_w, eff_gap_px);
+
+    // allowed_pair_lines：每个 cluster 最长 1V + 1H
+    std::map<int, std::pair<int, double>> best_v, best_h;
+    for (size_t i = 0; i < true_edges.size(); i++) {
+        int cid = labels[i];
+        double ang = angle_x_deg(true_edges[i].line);
+        double L = true_edges[i].length_px;
+        if (is_vert(true_edges[i].line, v_tol)) {
+            if (best_v[cid].second < L) best_v[cid] = {(int)i, L};
+        } else if (is_horiz(true_edges[i].line, h_tol)) {
+            if (best_h[cid].second < L) best_h[cid] = {(int)i, L};
+        }
+    }
+    std::vector<bool> allowed(true_edges.size(), false);
+    std::vector<int> pairable;
+    for (auto& [cid, pick] : best_v) if (pick.first >= 0) { allowed[pick.first] = true; pairable.push_back(pick.first); }
+    for (auto& [cid, pick] : best_h) if (pick.first >= 0) { allowed[pick.first] = true; pairable.push_back(pick.first); }
+    std::sort(pairable.begin(), pairable.end());
+    pairable.erase(std::unique(pairable.begin(), pairable.end()), pairable.end());
+
+    // potential_pairs 排序键：quadrant 兼容度，其次端点最近距离（Python sorted 稳定）
+    struct Pair { int i = 0, j = 0, compat = 2; double min_dist = 1e18; };
+    std::vector<Pair> pairs;
+    for (size_t a = 0; a < pairable.size(); a++) {
+        for (size_t b = a + 1; b < pairable.size(); b++) {
+            int i = pairable[a], j = pairable[b];
+            if (labels[i] != labels[j]) continue;
+            Pair p;
+            p.i = i; p.j = j;
+            p.compat = quadrant_compatibility(true_edges[i].line, true_edges[j].line, roi_w, roi_h);
+            double md = std::numeric_limits<double>::infinity();
+            const auto& l1 = true_edges[i].line;
+            const auto& l2 = true_edges[j].line;
+            for (int k = 0; k < 2; k++) {
+                for (int m = 0; m < 2; m++) {
+                    md = std::min(md, std::hypot(l1[2 * k] - l2[2 * m], l1[2 * k + 1] - l2[2 * m + 1]));
+                }
+            }
+            p.min_dist = md;
+            pairs.push_back(p);
+        }
+    }
+    std::stable_sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) {
+        if (a.compat != b.compat) return a.compat < b.compat;
+        return a.min_dist < b.min_dist;
+    });
+
+    // edges_for_drawing：接受为虚拟交点时会把线段端点移动到交点，影响后续配对
+    std::vector<cv::Vec4d> draw;
+    draw.reserve(true_edges.size());
+    for (auto& e : true_edges) draw.push_back(e.line);
+    std::vector<std::array<bool, 2>> endpoint_paired(true_edges.size(), {false, false});
+
+    double corner_gap_px = dd.corner_max_physical_gap_mm > 0
+        ? dd.corner_max_physical_gap_mm * px_per_mm
+        : (double)dd.corner_max_physical_gap;
+    double roi_ext_allow = 0.2 * (double)roi_w;
+
+    for (auto& p : pairs) {
+        int i = p.i, j = p.j;
+        if (labels[i] != labels[j]) continue;
+        if (endpoint_paired[i][0] && endpoint_paired[i][1]) continue;
+        if (endpoint_paired[j][0] && endpoint_paired[j][1]) continue;
+
+        const cv::Vec4d& l1 = draw[i];
+        const cv::Vec4d& l2 = draw[j];
+        double angle_between = angle_between_lines_adjust(l1, l2);
+        double max_extension_dist = max_extension_px(dd, angle_between, px_per_mm);
+
+        cv::Point2d inter;
+        if (!line_intersection(l1, l2, inter)) continue;
+        // 栅栏/玻璃边界在 batch 验证口径下均被 reset（fences/glass_boundary 不存在），
+        // 因此此处不额外限制交点 x 范围（Python 中 allow_min/allow_max 均为无穷）。
+
+        double v1x = l1[2] - l1[0], v1y = l1[3] - l1[1];
+        double v2x = l2[2] - l2[0], v2y = l2[3] - l2[1];
+        double L1 = v1x * v1x + v1y * v1y;
+        double L2 = v2x * v2x + v2y * v2y;
+        double t1 = L1 > 1e-9 ? ((inter.x - l1[0]) * v1x + (inter.y - l1[1]) * v1y) / L1 : -999.0;
+        double t2 = L2 > 1e-9 ? ((inter.x - l2[0]) * v2x + (inter.y - l2[1]) * v2y) / L2 : -999.0;
+
+        double d_i0 = std::hypot(inter.x - l1[0], inter.y - l1[1]);
+        double d_i1 = std::hypot(inter.x - l1[2], inter.y - l1[3]);
+        double d_j0 = std::hypot(inter.x - l2[0], inter.y - l2[1]);
+        double d_j1 = std::hypot(inter.x - l2[2], inter.y - l2[3]);
+        int ei = d_i0 <= d_i1 ? 0 : 1;   // np.argmin 取第一个
+        int ej = d_j0 <= d_j1 ? 0 : 1;
+        if (endpoint_paired[i][ei] || endpoint_paired[j][ej]) continue;
+
+        double max_extend_eff = std::max(max_extension_dist, roi_ext_allow);
+        double di = ei == 0 ? d_i0 : d_i1;
+        double dj = ej == 0 ? d_j0 : d_j1;
+        bool is_physical = di < corner_gap_px && dj < corner_gap_px;
+        bool is_valid_virtual = di < max_extend_eff && dj < max_extend_eff;
+        bool inside_i = (0.0 <= t1 && t1 <= 1.0);
+        bool inside_j = (0.0 <= t2 && t2 <= 1.0);
+        bool accept_inside = inside_i && inside_j;
+
+        if (!((accept_inside || is_physical || is_valid_virtual) &&
+              (0.0 <= inter.x && inter.x < (double)roi_w &&
+               0.0 <= inter.y && inter.y < (double)roi_h))) continue;
+
+        endpoint_paired[i][ei] = true;
+        endpoint_paired[j][ej] = true;
+        if (!accept_inside) {
+            draw[i][2 * ei] = inter.x;
+            draw[i][2 * ei + 1] = inter.y;
+            draw[j][2 * ej] = inter.x;
+            draw[j][2 * ej + 1] = inter.y;
+        }
+        out.push_back(inter);
+    }
+    return out;
+}
 
 std::vector<Defect> detect_q_defects(
     const cv::Mat& roi_gray,

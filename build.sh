@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# C++ 引擎一键构建脚本
-# 用法: bash build.bat  (Windows 下用 CMD 或 Git Bash 执行)
-
+# C++ 引擎 CMake 构建脚本
+# - Linux / macOS：直接使用 g++/clang + OpenCV
+# - Windows（Git Bash/msys）：推荐优先使用 build.bat（MSVC cl 直编，产线已验证）；
+#   如需用 CMake，请在 vcvars64 激活后的 shell 中执行本脚本。
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,7 +13,7 @@ THIRD_PARTY_DIR="$PROJECT_DIR/third_party"
 echo "=== C++ 引擎构建脚本 ==="
 echo "项目目录: $PROJECT_DIR"
 
-# 1. 下载 nlohmann/json (header-only)
+# 1. 确保 nlohmann/json (header-only)
 JSON_DIR="$THIRD_PARTY_DIR/nlohmann"
 JSON_FILE="$JSON_DIR/json.hpp"
 if [ ! -f "$JSON_FILE" ]; then
@@ -24,24 +25,28 @@ else
     echo "--- nlohmann/json 已存在 ---"
 fi
 
-# 2. 构建
+# 2. CMake 配置与构建
 echo "--- 配置 CMake ---"
-mkdir -p "$BUILD_DIR"
-cd "$BUILD_DIR"
-
-# 设置 MSVC 环境
-MSVC_BAT="F:/VS2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat"
-if [ -f "$MSVC_BAT" ]; then
-    echo "调用 MSVC 环境: $MSVC_BAT"
-    # 在 Windows 上需要先执行 vcvars64.bat
+if [[ "${OS:-}" == "Windows_NT" || "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
+    echo "Windows 环境：使用 MSVC 生成器（需已激活 vcvars64 环境）"
+    cmake "$PROJECT_DIR" -B "$BUILD_DIR" -A x64
+    echo "--- 构建 ---"
+    cmake --build "$BUILD_DIR" --config Release
+else
+    cmake "$PROJECT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
+    echo "--- 构建 ---"
+    nproc_bin="$(command -v nproc || true)"
+    if [ -n "$nproc_bin" ]; then
+        JOBS="$("$nproc_bin")"
+    else
+        JOBS=4
+    fi
+    cmake --build "$BUILD_DIR" -j "$JOBS"
 fi
 
-cmake "$PROJECT_DIR" -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="$THIRD_PARTY_DIR" \
-    -DCMAKE_CXX_FLAGS="/std:c++20 /utf-8"
-
-echo "--- 构建 ---"
-cmake --build . --config Release
-
 echo "=== 构建完成 ==="
-echo "可执行文件: $BUILD_DIR/Release/glass_engine.exe"
+if [[ "${OS:-}" == "Windows_NT" || "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
+    echo "可执行文件: $BUILD_DIR/Release/glass_engine.exe"
+else
+    echo "可执行文件: $BUILD_DIR/glass_engine"
+fi

@@ -660,11 +660,119 @@ void inject_shared_verticals(std::vector<MergedLine>& merged,
         ml.line = cseg;
         ml.length_px = std::hypot(cseg[2] - cseg[0], cseg[3] - cseg[1]);
         ml.angle_deg = fold_angle_deg_abs(std::atan2(cseg[3] - cseg[1], cseg[2] - cseg[0]) * 180.0 / CV_PI);
-        ml.support = (int)std::lround(ml.length_px);
+        ml.support = ml.length_px;
         ml.near_vertical = true;
         ml.near_horizontal = false;
         merged.push_back(ml);
     }
+}
+
+// B 的 minAreaRect：优先用合并后轮廓（镜像 Python chipping_defects 保存的 min_area_rect），
+// 轮廓不足 3 点时退回 box_points。
+cv::RotatedRect defect_min_area_rect(const Defect& d) {
+    if (d.region_contour.size() >= 3) return cv::minAreaRect(d.region_contour);
+    return cv::minAreaRect(d.box_points);
+}
+
+// 镜像 Python _rotated_rect_intersect（find_and_analyze_defects 4416-4459）
+bool rotated_rects_intersect(const cv::RotatedRect& r1, const cv::RotatedRect& r2) {
+    try {
+        std::vector<cv::Point2f> inter;
+        int ret = cv::rotatedRectangleIntersection(r1, r2, inter);
+        if (ret == 1 || ret == 2) {
+            if (inter.size() >= 3) return std::abs(cv::contourArea(inter)) >= 1.0;
+            return true;
+        }
+        cv::Point2f b1[4], b2[4];
+        r1.points(b1); r2.points(b2);
+        std::vector<cv::Point2f> p1(b1, b1 + 4), p2(b2, b2 + 4);
+        std::vector<cv::Point2f> out;
+        float area = cv::intersectConvexConvex(p1, p2, out);
+        return area >= 1.0f;
+    } catch (...) {
+        return false;
+    }
+}
+
+// 镜像 Python 4396-4520：B 重叠旋转矩形并查集合并。
+// 仅 B_MERGE_MIN_SIDE_MM（默认 2mm）以上的 B 参与合并；小 B 原样保留。
+std::vector<Defect> merge_overlapping_b_defects(std::vector<Defect> defects,
+                                                const InspectorParams& params,
+                                                double px_per_mm) {
+    std::vector<Defect> out;
+    std::vector<size_t> b_merge_idx, b_small_idx;
+    for (size_t i = 0; i < defects.size(); i++) {
+        if (defects[i].type != "B") { out.push_back(defects[i]); continue; }
+        cv::RotatedRect rr = defect_min_area_rect(defects[i]);
+        double w_mm = std::max(rr.size.width, rr.size.height) / px_per_mm;
+        double h_mm = std::min(rr.size.width, rr.size.height) / px_per_mm;
+        double min_side = params.defect_detection.b_merge_min_side_mm > 0
+            ? params.defect_detection.b_merge_min_side_mm : 2.0;
+        if (std::min(w_mm, h_mm) >= min_side) b_merge_idx.push_back(i);
+        else b_small_idx.push_back(i);
+    }
+    for (size_t k : b_small_idx) out.push_back(defects[k]);
+
+    size_t n = b_merge_idx.size();
+    if (n == 0) return out;
+
+    std::vector<size_t> parent(n);
+    for (size_t i = 0; i < n; i++) parent[i] = i;
+    auto find = [&](size_t x) {
+        while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+        return x;
+    };
+    auto union_set = [&](size_t a, size_t b) {
+        size_t ra = find(a), rb = find(b);
+        if (ra != rb) parent[rb] = ra;
+    };
+    for (size_t i = 0; i < n; i++) {
+        const Defect& di = defects[b_merge_idx[i]];
+        if (di.box_points.size() < 4) continue;
+        cv::RotatedRect ri = defect_min_area_rect(di);
+        for (size_t j = i + 1; j < n; j++) {
+            const Defect& dj = defects[b_merge_idx[j]];
+            if (dj.box_points.size() < 4) continue;
+            cv::RotatedRect rj = defect_min_area_rect(dj);
+            if (rotated_rects_intersect(ri, rj)) union_set(i, j);
+        }
+    }
+
+    std::map<size_t, std::vector<size_t>> groups;
+    for (size_t i = 0; i < n; i++) groups[find(i)].push_back(i);
+    for (auto& [root, members] : groups) {
+        if (members.size() == 1) {
+            out.push_back(defects[b_merge_idx[members[0]]]);
+            continue;
+        }
+        std::vector<cv::Point2f> pts;
+        for (size_t m : members) {
+            for (auto& p : defects[b_merge_idx[m]].box_points) pts.emplace_back((float)p.x, (float)p.y);
+        }
+        if (pts.empty()) {
+            out.push_back(defects[b_merge_idx[members[0]]]);
+            continue;
+        }
+        std::vector<cv::Point2f> hull;
+        cv::convexHull(pts, hull);
+        cv::RotatedRect fused_rect = cv::minAreaRect(hull);
+        cv::Point2f fused_pts[4];
+        fused_rect.points(fused_pts);
+        Defect d;
+        d.type = "B";
+        d.confidence = defects[b_merge_idx[members[0]]].confidence;
+        d.roi_index = defects[b_merge_idx[members[0]]].roi_index;
+        double cx = 0, cy = 0;
+        for (auto& p : fused_pts) {
+            d.box_points.push_back(cv::Point((int)p.x, (int)p.y));  // Python np.intp 向零截断
+            cx += p.x; cy += p.y;
+        }
+        cx /= 4.0; cy /= 4.0;
+        d.x = (int)cx; d.y = (int)cy;
+        for (auto& p : hull) d.region_contour.push_back(cv::Point((int)p.x, (int)p.y));
+        out.push_back(d);
+    }
+    return out;
 }
 
 } // namespace
@@ -772,6 +880,11 @@ std::vector<Defect> Detector::process_roi(
         }
     }
 
+    // 未产生 Q 的直线配对交点（局部坐标），用于过滤交点附近的 B 误检。
+    // 镜像 Python find_and_analyze_defects 的 non_q_intersections + B_FILTER_NEAR_NONQ_INTERSECTION_RADIUS_MM。
+    std::vector<cv::Point2d> non_q_intersections =
+        collect_non_q_intersections(merged, params, px_per_mm_, roi_gray.cols, roi_gray.rows);
+
     std::vector<Defect> defects;
     {
         std::vector<std::vector<cv::Point>> all_chipping_contours;
@@ -849,6 +962,51 @@ std::vector<Defect> Detector::process_roi(
     }
     for (auto& d : defects) d.roi_index = roi_idx;
 
+    // find_and_analyze_defects 内的 B 预过滤顺序：
+    // 1) 细长窄 B 距离门控 -> 2) 非 Q 交点附近过滤 -> 3) 重叠旋转矩形并查集合并。
+    // 这些步骤必须在阴影/圆形度/平行抑制/B→L（process_roi_hough_based 后处理）之前完成。
+    {
+        double ar_min_gate = params.defect_detection.b_filter_parallel_ar_min > 0
+            ? params.defect_detection.b_filter_parallel_ar_min : 10.0;
+        double min_side_gate = params.defect_detection.b_filter_parallel_min_side_mm > 0
+            ? params.defect_detection.b_filter_parallel_min_side_mm : 2.0;
+        double max_edge_dist_px = params.defect_detection.b_max_distance_to_edge_mm * px_per_mm_;
+
+        std::vector<Defect> after_gate;
+        for (auto& d : defects) {
+            if (d.type != "B") { after_gate.push_back(d); continue; }
+            cv::RotatedRect rr = defect_min_area_rect(d);
+            double w_px = std::max(rr.size.width, rr.size.height);
+            double h_px = std::min(rr.size.width, rr.size.height);
+            double width_mm = h_px / px_per_mm_;
+            double ar = h_px > 1e-6 ? w_px / h_px : 1e9;
+            cv::Point2d center(rr.center.x, rr.center.y);
+            if (ar > ar_min_gate && width_mm < min_side_gate) {
+                double min_d = std::numeric_limits<double>::infinity();
+                for (auto& ml : merged)
+                    min_d = std::min(min_d, point_to_line_dist_inf(center.x, center.y, ml.line));
+                if (min_d > max_edge_dist_px) continue;
+            }
+            after_gate.push_back(d);
+        }
+
+        std::vector<Defect> after_nonq;
+        double nonq_radius_px = params.defect_detection.b_filter_near_nonq_intersection_radius_mm * px_per_mm_;
+        for (auto& d : after_gate) {
+            if (d.type != "B" || non_q_intersections.empty()) { after_nonq.push_back(d); continue; }
+            cv::RotatedRect rr = defect_min_area_rect(d);
+            double min_nonq_d = std::numeric_limits<double>::infinity();
+            for (auto& pt : non_q_intersections) {
+                min_nonq_d = std::min(min_nonq_d, std::hypot(rr.center.x - pt.x, rr.center.y - pt.y));
+                if (min_nonq_d <= nonq_radius_px) break;
+            }
+            if (min_nonq_d <= nonq_radius_px) continue;
+            after_nonq.push_back(d);
+        }
+
+        defects = merge_overlapping_b_defects(std::move(after_nonq), params, px_per_mm_);
+    }
+
     // B 过滤链（镜像 Python find_and_analyze_defects 的 B 距离门控 + process_roi 的
     // 阴影/圆形度/平行抑制/B→L/L 过滤链，image_processor_hough.py:4229-4360、5478-5689）
     {
@@ -914,8 +1072,8 @@ std::vector<Defect> Detector::process_roi(
         std::vector<Defect> b_filtered;
         for (auto& d : defects) {
             if (d.type != "B") { b_filtered.push_back(d); continue; }
-            // 从 box_points 重算 minAreaRect
-            cv::RotatedRect rr = cv::minAreaRect(d.box_points);
+            // 用合并后轮廓重算 minAreaRect（镜像 Python raw_defect.min_area_rect）
+            cv::RotatedRect rr = defect_min_area_rect(d);
             double w_px = std::max(rr.size.width, rr.size.height);
             double h_px = std::min(rr.size.width, rr.size.height);
             double width_mm = h_px / px_per_mm_;
@@ -923,19 +1081,10 @@ std::vector<Defect> Detector::process_roi(
             double ar = h_px > 1e-6 ? w_px / h_px : 1e9;
             cv::Point2d center(rr.center.x, rr.center.y);
 
-            // 1) find_and_analyze_defects 内：细长窄 B 距主边过远门控
-            //    （ar>B_FILTER_PARALLEL_AR_MIN 且宽<B_FILTER_PARALLEL_MIN_SIDE_MM → 中心到无限直线 > B_MAX_DISTANCE_TO_EDGE_MM 过滤）
             double ar_min_gate = params.defect_detection.b_filter_parallel_ar_min > 0
                 ? params.defect_detection.b_filter_parallel_ar_min : 10.0;
             double min_side_gate = params.defect_detection.b_filter_parallel_min_side_mm > 0
                 ? params.defect_detection.b_filter_parallel_min_side_mm : 2.0;
-            double max_edge_dist_px = params.defect_detection.b_max_distance_to_edge_mm * px_per_mm_;
-            if (ar > ar_min_gate && width_mm < min_side_gate) {
-                double min_d = std::numeric_limits<double>::infinity();
-                for (auto& ml : merged)
-                    min_d = std::min(min_d, point_to_line_dist_inf(center.x, center.y, ml.line));
-                if (min_d > max_edge_dist_px) continue;
-            }
 
             // 2) 阴影过滤：contour 面积 / minAreaRect 面积 < SHADOW_FILTER_MIN_EXTENT_RATIO
             if (!d.region_contour.empty()) {
@@ -1145,7 +1294,13 @@ DetectionResult Detector::detect(const cv::Mat& image_gray) {
             // 跨 ROI 预收集阶段也裁剪 zones（镜像 Python 6457-6459，min_segment_len=10）
             per_roi_merged.push_back(clip_lines_at_exclusion_zones(merged_i, rois[i].x, rois[i].y, zones, 10.0));
         }
-        std::vector<cv::Vec4d> shared = collect_shared_vertical_edges(rois, per_roi_merged, *params, px_per_mm_);
+        // Python 暗场生产入口 image_processor_hough_dark 是薄封装：直接逐 ROI 调用
+        // process_roi_hough_based，不做跨 ROI 共享竖直边预收集；C++ 暗场也必须跳过，
+        // 否则会把其它 ROI 的竖直边注入当前 ROI，生成 Python 暗场没有的 B 候选。
+        std::vector<cv::Vec4d> shared;
+        if (config_.mode != "dark") {
+            shared = collect_shared_vertical_edges(rois, per_roi_merged, *params, px_per_mm_);
+        }
         for (size_t i = 0; i < rois.size(); i++) {
             auto defects = process_roi(image_gray, rois[i], *params, (int)i, per_roi_merged[i], shared, zones);
             all_defects.insert(all_defects.end(), defects.begin(), defects.end());

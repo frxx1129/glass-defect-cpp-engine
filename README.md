@@ -14,9 +14,8 @@ Python 引擎仓库（`glass-defect-algo`）采用 PolyForm Noncommercial Licens
 
 ## 运行环境
 
-- Windows 产线主机
-- MSVC（Visual Studio Build Tools，`vcvars64.bat`）
-- OpenCV 4.10（`opencv_world4100.lib`）
+- Windows 产线主机：MSVC（Visual Studio Build Tools，`vcvars64.bat`）+ OpenCV 4.10（`opencv_world4100.lib`）
+- Linux/WSL（Ubuntu）：g++ 13 + CMake 3.28 + OpenCV 4.6，已在本仓库复跑验证
 - nlohmann/json（已内置于 `third_party/`，无需单独安装）
 
 ## 主要入口
@@ -38,10 +37,10 @@ Python 引擎仓库（`glass-defect-algo`）采用 PolyForm Noncommercial Licens
 - 算法模块：`src/detector.cpp`、`src/line_merge.cpp`、`src/skew.cpp`、`src/corner.cpp`、`src/luminosity.cpp`、`src/classify.cpp`、`src/preprocess.cpp`、`src/static_artifact.cpp`
 - 公共头文件：`include/engine/`（config / types / detector / line_merge / skew / corner / luminosity / classify / preprocess / static_artifact / json_io）
 - JSON I/O：`src/json_io.cpp`
-- 构建：`build.bat`（Windows，cl 直接编译，**已验证可用**）、`build.sh`（Git Bash 下调用 MSVC 的 CMake 脚本，**未验证**）、`CMakeLists.txt`（**未验证**，此前 CMake 方式曾遇到编译器识别问题）
-- 验证与调用：`scripts/batch_compare.py`、`scripts/compare_engine.py`、`scripts/cpp_engine_wrapper.py`
+- 构建：`build.bat`（Windows，cl 直接编译，**已验证可用**）、`build.sh` + `CMakeLists.txt`（Windows/Git Bash 及 Linux/WSL 均可，Linux 路径**已验证可用**）
+- 验证与调用：`scripts/batch_compare.py`（支持 Windows/WSL 路径与 `--dark` 暗场对比）、`scripts/compare_engine.py`、`scripts/cpp_engine_wrapper.py`
 - 依赖：`third_party/nlohmann/json.hpp`
-- 测试：`tests/engine_tests.cpp`（基础单测源码：配置解析/预处理/空输入安全；未接入 build.bat 主构建，未验证）
+- 测试：`tests/engine_tests.cpp`（基础单测：配置解析/预处理/空输入安全；CMake 构建后 `ctest` **已验证通过**）
 - 存档：`legacy/`（旧版半成品）
 
 ## 构建方法（已验证路径）
@@ -64,6 +63,15 @@ cl /nologo /std:c++20 /utf-8 /EHsc /O2 /DNDEBUG ^
 - 必须先跑 `vcvars64.bat`（PowerShell 直接执行 .bat 不保留环境变量）。
 - 源文件列表共 10 个（json_io / preprocess / line_merge / classify / static_artifact / detector / skew / luminosity / corner / main），勿漏。
 - 产物为 `build_new\glass_engine.exe`，构建产物不进入 Git。
+
+Linux / WSL（Ubuntu）下直接运行：
+
+```bash
+./build.sh
+# 产物：build/glass_engine；单元测试：ctest --test-dir build --output-on-failure
+```
+
+`build.sh` 会自动查找系统 OpenCV 并生成 `build/glass_engine`。Windows Git Bash 也可调用同一脚本（需先在 vcvars64 激活后的 shell 中执行）；产线 Windows 推荐继续使用 `build.bat`。
 
 ## 使用方式
 
@@ -98,10 +106,12 @@ glass_engine --batch < input.jsonl
 | cam1（77 图） | `config.yaml`（Line3） | `cam1_roi_averaged_by_group.json` | 77/77 全一致 |
 | line2 0119 original（45 图） | `config2.yaml`（Line2） | `roi_averaged_by_group_CORRECTED.json` | 45/45 全一致 |
 | bugs（27 图，含 cam3 混入） | `config.yaml`（Line3） | `cam1_roi_averaged_by_group.json` | 27/27 全一致 |
+| cam5（naobo_line2 instant_replay，等间隔抽 40 帧） | `config2.yaml`（Line2） | `cam5_roi_averaged_by_group.json`（cam=2） | 40/40 全一致 |
+| 暗场模式冒烟（cam1 明场图 + `hough_inspector_dark_params`，等间隔抽 40 张） | `config.yaml` | `cam1_roi_averaged_by_group.json`（cam=4） | 40/40 全一致 |
 
-合计 **288 张，DIFF=0**。批量对比时工具会对每张图深拷贝配置并重置 Python 全局缓存（`reset_global_caches`），避免 Python 参考的跨帧稳定器（栅栏/玻璃边界/理想竖直缓存）在 ROI_ID 未设置时跨图串扰导致结果不稳定。本次全盘复查（对齐检查指示文档）后已按同样口径复跑 4 个批次，仍为 288 张 DIFF=0。
+合计明场基线 **288 张，DIFF=0**（本次在 Linux/WSL 构建上复跑）。批量对比时工具会对每张图深拷贝配置并重置 Python 全局缓存（`reset_global_caches`），避免 Python 参考的跨帧稳定器（栅栏/玻璃边界/理想竖直缓存）在 ROI_ID 未设置时跨图串扰导致结果不稳定。
 
-待验证：cam5、暗场模式（需对应 ROI 模板与测试数据，以现场机器为准）。
+待验证：真实暗场图片（当前暗场冒烟只能证明“暗场参数 + 暗场入口”在明场图上的 C++/Python 一致性，不能替代产线暗场图验证）。
 
 调试编译宏：
 
@@ -118,10 +128,10 @@ glass_engine --batch < input.jsonl
 - Python 引擎（`image_processor_hough.py`，约 6700 行）是生产参考实现；C++ 引擎逐模块镜像其算法与阈值。
 - **Python 参考侧修复（仅本地验证基准，未改动 GitHub fork）**：`find_and_analyze_defects` 的 Q 检测（corner_contour 块）存在两处未定义名称（`_q_enabled_runtime`、`_angle_to_x_axis_deg`），被外层 `except: pass` 吞掉后 Q 检测从未真正执行（上游 zay002 原版与 fork 均如此）。本地验证基准补上这两处定义后，Python 才按算法意图输出 Q，C++ 的 Q 引擎与之逐图对齐。
 - **Python 参考侧另发现一处同类死代码（未修复基准）**：`merge_lines_and_get_main_edges` 的“竖直线跨角度簇二次合并”块（`VERTICAL_ACROSS_ANGLE_MERGE_ENABLE`）在块内引用了定义在块之后的 `_angle_deg`，执行时 NameError 被外层 `except: pass` 吞掉，因此该功能在本地基准中从未实际运行。C++ 已移植该实现但按基准可观测行为保持关闭（`line_merge.cpp` 内 `vertical_across_angle_actually_runs_in_python=false`），上游修复该前向引用后应同步打开。
-- C++ 侧对齐项（均镜像 Python 语义，非调阈值）：亮度扫描掩膜取整（np.int32 截断）、E 重叠合并含端点宽度、E_FROM_MAIN/主边屏蔽带近水平容差（HORIZONTAL_ANGLE_TOL_DEG 缺省 10，与轮廓路径的 v_tol 分离）、水平轴向锁定 Canny 拟合（HORIZONTAL_LOCK_FIT_*）、Q 主体聚类 X/Y 回退二分、射线求交 u 符号、角点 (竖直,水平) 顺序、三角形顶点/box_points 取整、平行四边形条带剔除（保留抗锯齿像素）、射线未命中哨兵判定、Q 单边命中分支全图亮度均值（替换原网格采样）、B 过滤链顺序与最近主边/角度修约、L 端点扫描带与近主边过滤、默认值逐键对齐、Line2/Line3 cam3 exclusion zones（边缘遮罩/主边裁剪/E 过滤）。
+- C++ 侧对齐项（均镜像 Python 语义，非调阈值）：亮度扫描掩膜取整（np.int32 截断）、E 重叠合并含端点宽度、E_FROM_MAIN/主边屏蔽带近水平容差（HORIZONTAL_ANGLE_TOL_DEG 缺省 10，与轮廓路径的 v_tol 分离）、水平轴向锁定 Canny 拟合（HORIZONTAL_LOCK_FIT_*）、Q 主体聚类 X/Y 回退二分、射线求交 u 符号、角点 (竖直,水平) 顺序、三角形顶点/box_points 取整、平行四边形条带剔除（保留抗锯齿像素）、射线未命中哨兵判定、Q 单边命中分支全图亮度均值（替换原网格采样）、merge score/support 使用浮点原始长度和（此前 int 舍入会在暗场 0.8° 容差下造成 topN 差 1 条）、B 非 Q 交点附近过滤、B 重叠旋转矩形并查集合并、暗场跳过跨 ROI 共享竖直边预收集（镜像 `image_processor_hough_dark` 薄封装）、B 过滤链顺序与最近主边/角度修约、L 端点扫描带与近主边过滤、默认值逐键对齐、Line2/Line3 cam3 exclusion zones（边缘遮罩/主边裁剪/E 过滤）。
 - **当前状态**：C++ 引擎仅完成独立运行与对比验证，未接入生产链路，也未用于生产替换。
-- 已知未实现（当前 288 张测试数据上最终缺陷数量无差异）：`_detect_edge_notches`（Python 会生成原始 Q 再被后续长度/宽度过滤全部滤除）、`scan_edge_for_chipping_blocks`（配置默认关闭，测试数据 0 调用）、X 型缺陷（Python 硬编码 `disable_x_defects=True`）、跨帧栅栏/玻璃边界/理想竖直缓存（batch 验证每图重置缓存，产线连续帧行为未镜像）、理想竖直 Canny 列峰（全 288 张实测 `rois_added_ideal=0`）、B 重叠旋转矩形合并与非 Q 交点附近 B 过滤（测试数据未触发数量差异）、暗场（无数据未验）。
-- 配置两套：`hough_inspector_params`（明场，生产使用）/ `hough_inspector_dark_params`（暗场，解析已对齐，无真实暗场数据验证）。
+- 已知未实现（当前测试数据上最终缺陷数量无差异）：`_detect_edge_notches`（Python 会生成原始 Q 再被后续长度/宽度过滤全部滤除）、`scan_edge_for_chipping_blocks`（配置默认关闭，测试数据 0 调用）、X 型缺陷（Python 硬编码 `disable_x_defects=True`）、跨帧栅栏/玻璃边界/理想竖直缓存（batch 验证每图重置缓存，产线连续帧行为未镜像）、理想竖直 Canny 列峰（全 288 张实测 `rois_added_ideal=0`）。
+- 暗场：C++ 按请求 `mode=dark` 选择 `hough_inspector_dark_params`，并镜像 Python 暗场入口 `image_processor_hough_dark.py` 的行为（不预收集跨 ROI 共享竖直边）。`batch_compare.py --dark` 已修正为“Python 暗场入口 vs C++ 暗场参数”的同一口径；明场图暗场参数冒烟 40 张 DIFF=0，真实暗场图仍待产线数据。
 
 ## 目录维护约定
 
