@@ -1,6 +1,7 @@
-﻿#pragma once
+#pragma once
 #include "engine/config.h"
 #include "engine/types.h"
+#include "engine/line_merge.h"
 #include "engine/static_artifact.h"
 #include <map>
 #include <memory>
@@ -34,11 +35,14 @@ private:
     std::map<std::string, StaticArtifactTracker> trackers_;
 
     // 单 ROI 检测：预处理 -> Hough -> 直线合并 -> 缺陷分类
+    // merged_in: 预计算的合并主边（空则内部计算）；shared_verticals: 跨 ROI 共享竖直边（全局坐标，空则跳过注入）
     std::vector<Defect> process_roi(
         const cv::Mat& image_gray,
         const RoiRect& roi,
         const InspectorParams& params,
-        int roi_idx);
+        int roi_idx,
+        const std::vector<MergedLine>& merged_in = {},
+        const std::vector<cv::Vec4d>& shared_verticals = {});
 
     // 加载图像（UTF-8 路径、内存解码）
     cv::Mat load_image(const std::string& image_path);

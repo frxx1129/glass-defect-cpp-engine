@@ -3,6 +3,7 @@
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <map>
 
@@ -108,7 +109,9 @@ bool q_parallelogram_cluster_ok(const Defect& q, const cv::Mat& edges_img, const
                      cv::Point((int)std::lround(e.x), (int)std::lround(e.y)),
                      cv::Scalar(255), thick, cv::LINE_AA);
         }
-        inner.setTo(0, exclude);   // inner &= ~exclude
+        cv::Mat not_excl;
+        cv::bitwise_not(exclude, not_excl);
+        cv::bitwise_and(inner, not_excl, inner);   // 镜像 Python: inner &= ~exclude（保留抗锯齿部分像素）
     }
 
     cv::Mat cand;
@@ -145,7 +148,8 @@ bool q_parallelogram_cluster_ok(const Defect& q, const cv::Mat& edges_img, const
     return false;
 }
 
-// 主体聚类：近竖直边 x 中点间隙二分
+// 主体聚类：近竖直边 x 中点间隙二分（镜像 Python find_and_analyze_defects 的 cluster 划分：
+// 无 >=2 条竖直边时回退到“全部边的 X/Y 中点最大间隙”二分）
 std::vector<int> build_clusters(const std::vector<MergedLine>& edges, double v_tol, int roi_w) {
     std::vector<int> labels(edges.size(), 0);
     std::vector<std::pair<double, int>> xs;
@@ -165,6 +169,32 @@ std::vector<int> build_clusters(const std::vector<MergedLine>& edges, double v_t
             for (size_t i = 0; i < edges.size(); i++) {
                 double mx = (edges[i].line[0] + edges[i].line[2]) * 0.5;
                 labels[i] = mx <= th ? 0 : 1;
+            }
+        }
+    }
+    // Python 回退：未能按竖直边分裂（所有边仍为 0 簇）时，按全部边的 X 中点、其次 Y 中点
+    // 的最大间隙二分（Python: np.max(cluster_labels)==0 and len(edges)>=4 and eff_gap>0）
+    bool any_one = false;
+    for (auto l : labels) if (l == 1) { any_one = true; break; }
+    double eff_gap = 0.08 * roi_w;
+    if (!any_one && edges.size() >= 4 && eff_gap > 0) {
+        for (int dim = 0; dim < 2; dim++) {
+            std::vector<std::pair<double, int>> ord;
+            for (size_t i = 0; i < edges.size(); i++) {
+                double v = dim == 0 ? (edges[i].line[0] + edges[i].line[2]) * 0.5
+                                    : (edges[i].line[1] + edges[i].line[3]) * 0.5;
+                ord.push_back({v, (int)i});
+            }
+            std::sort(ord.begin(), ord.end());
+            double max_gap = -1; int max_k = -1;
+            for (size_t k = 0; k + 1 < ord.size(); k++) {
+                double g = ord[k + 1].first - ord[k].first;
+                if (g > max_gap) { max_gap = g; max_k = (int)k; }
+            }
+            if (max_k >= 0 && max_gap >= eff_gap) {
+                for (size_t k = 0; k < ord.size(); k++)
+                    labels[ord[k].second] = (int)k <= max_k ? 0 : 1;
+                break;
             }
         }
     }
@@ -219,7 +249,10 @@ bool ray_intersect_contour(const cv::Point2d& origin, const cv::Point2d& dir,
         if (std::abs(det) < 1e-9) continue;
         double rhsx = a.x - origin.x, rhsy = a.y - origin.y;
         double t = (rhsx * ey - rhsy * ex) / det;
-        double u = (dx * rhsy - dy * rhsx) / det;
+        // 镜像 Python _ray_intersect_contour：u 的分子/分母需与 Python 一致
+        // （Python: u = (dx*rhsy - dy*rhsx) / (dy*ex - dx*ey)）。
+        // 此处 det = dx*ey - dy*ex = -(dy*ex - dx*ey)，故 u 须取负号，否则命中边错误。
+        double u = (dy * rhsx - dx * rhsy) / det;
         if (t >= t_min && u >= 0.0 && u <= 1.0 && t < best_t) {
             best_t = t;
             hit = cv::Point2d(origin.x + dx * t, origin.y + dy * t);
@@ -322,7 +355,15 @@ std::vector<Defect> detect_q_defects(
                     !fuzzy_hv_intersection(l2, l1, 3, inter)) continue;
             }
             if (!(inter.x >= 0 && inter.x < roi_w && inter.y >= 0 && inter.y < roi_h)) continue;
-            corners.push_back({i, j, inter});
+            // 与 Python 对齐：corner 存储顺序固定为 (竖直边, 水平边)。
+            // Python 的 supplement 收集是 idx_vertical 外层 × idx_horizontal 内层 → (V,H)；
+            // 若按索引存 (H,V)，三角顶点顺序不同 → 平行四边形差 1px → 过滤结果翻转
+            // （如 cam-1_ts1765692711692 的 Q@(860,619)）。
+            if (is_horiz(l1, h_tol) && is_vert(l2, v_tol)) {
+                corners.push_back({j, i, inter});
+            } else {
+                corners.push_back({i, j, inter});
+            }
         }
     }
 
@@ -401,15 +442,31 @@ std::vector<Defect> detect_q_defects(
             }
         }
 
+#ifdef CPP_DEBUG_Q
+        std::cerr << "[Q-CORNER] roi cp=(" << cp.x << "," << cp.y << ") i=" << c.i << " j=" << c.j
+                  << " seg0=(" << true_edges[c.i].line[0] << "," << true_edges[c.i].line[1] << ")->("
+                  << true_edges[c.i].line[2] << "," << true_edges[c.i].line[3] << ")"
+                  << " seg1=(" << true_edges[c.j].line[0] << "," << true_edges[c.j].line[1] << ")->("
+                  << true_edges[c.j].line[2] << "," << true_edges[c.j].line[3] << ")"
+                  << " hits=" << hits.size();
+        for (size_t hk = 0; hk < hits.size(); hk++)
+            std::cerr << " hit" << hk << "=(" << hits[hk].x << "," << hits[hk].y << ") dir=("
+                      << chosen_dirs[hk].x << "," << chosen_dirs[hk].y << ")";
+        std::cerr << std::endl;
+#endif
+
         // ---- 双边命中：三角形法 ----
-        if (hits.size() == 2 && chosen_dirs[0].x != 0 && chosen_dirs[1].x != 0) {
+        // 未命中哨兵为 (0,0)，须同时检查 x/y；垂直射线方向 (0,±1) 的 x 为 0 不能算未命中
+        bool hit0_ok = (chosen_dirs.size() > 0 && (chosen_dirs[0].x != 0 || chosen_dirs[0].y != 0));
+        bool hit1_ok = (chosen_dirs.size() > 1 && (chosen_dirs[1].x != 0 || chosen_dirs[1].y != 0));
+        if (hits.size() == 2 && hit0_ok && hit1_ok) {
             double d1 = std::hypot(hits[0].x - cp.x, hits[0].y - cp.y);
             double d2 = std::hypot(hits[1].x - cp.x, hits[1].y - cp.y);
             if (d1 < min_hit_dist_px || d2 < min_hit_dist_px) continue;
 
-            std::vector<cv::Point> tri = {cv::Point((int)std::lround(cp.x), (int)std::lround(cp.y)),
-                                          cv::Point((int)std::lround(hits[0].x), (int)std::lround(hits[0].y)),
-                                          cv::Point((int)std::lround(hits[1].x), (int)std::lround(hits[1].y))};
+            std::vector<cv::Point> tri = {cv::Point((int)cp.x, (int)cp.y),
+                                          cv::Point((int)hits[0].x, (int)hits[0].y),
+                                          cv::Point((int)hits[1].x, (int)hits[1].y)};
             double tri_area_px = std::abs(cv::contourArea(tri));
             if (tri_area_px <= 1.0) continue;
 
@@ -442,7 +499,8 @@ std::vector<Defect> detect_q_defects(
         }
         // 单边命中（竖直 miss + 水平 hit）：垂直裁剪三角形法（简化：选亮度暗侧端点）
         else if (hits.size() == 1) {
-            int hit_k = chosen_dirs[0].x != 0 ? 0 : 1;
+            bool d0_ok = (chosen_dirs.size() > 0 && (chosen_dirs[0].x != 0 || chosen_dirs[0].y != 0));
+            int hit_k = d0_ok ? 0 : 1;
             int miss_k = 1 - hit_k;
             const cv::Vec4d& seg_hit = segs[hit_k];
             const cv::Vec4d& seg_miss = segs[miss_k];
@@ -474,9 +532,9 @@ std::vector<Defect> detect_q_defects(
             } else {
                 v_clip = v_up;
             }
-            std::vector<cv::Point> tri = {cv::Point((int)std::lround(cp.x), (int)std::lround(cp.y)),
-                                          cv::Point((int)std::lround(pt_hit.x), (int)std::lround(pt_hit.y)),
-                                          cv::Point((int)std::lround(v_clip.x), (int)std::lround(v_clip.y))};
+            std::vector<cv::Point> tri = {cv::Point((int)cp.x, (int)cp.y),
+                                          cv::Point((int)pt_hit.x, (int)pt_hit.y),
+                                          cv::Point((int)v_clip.x, (int)v_clip.y)};
             double tri_area_px = std::abs(cv::contourArea(tri));
             if (tri_area_px <= 1.0) continue;
             cv::RotatedRect r = cv::minAreaRect(tri);

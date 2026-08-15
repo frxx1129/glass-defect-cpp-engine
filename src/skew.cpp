@@ -173,11 +173,14 @@ std::vector<Defect> detect_e_defects(
     // ---- 3. 主边中的斜向线直接作为 E 候选 ----
     if (dd.e_include_skew_main_edges && !true_edges.empty()) {
         double min_len_px_for_main = dd.e_from_main_edge_min_len_mm * px_per_mm;
+        // 镜像 Python E_INCLUDE_SKEW_MAIN_EDGES 段：近水平容差用 HORIZONTAL_ANGLE_TOL_DEG（默认 10），
+        // 与轮廓路径（用 v_tol=15）不同，否则 10-15° 的斜主边被误跳过（cam-1_ts1765689131686）
+        double h_tol_main = dd.horizontal_angle_tol_deg > 0 ? dd.horizontal_angle_tol_deg : 10.0;
         for (auto& ml : true_edges) {
             // 折叠到 [0,90]（镜像 Python：ang = abs(atan2); if ang>90: ang=180-ang）
             double ang = angle_abs_deg(ml.angle_deg);
 
-            if (ang <= h_tol || ang >= (90.0 - v_tol)) continue;
+            if (ang <= h_tol_main || ang >= (90.0 - v_tol)) continue;
             if (ml.length_px < min_len_px_for_main) continue;
             double xmn = std::min(ml.line[0], ml.line[2]);
             double xmx = std::max(ml.line[0], ml.line[2]);
@@ -283,7 +286,7 @@ std::vector<Defect> detect_e_defects(
             minx = std::min(minx, pt.x); miny = std::min(miny, pt.y);
             maxx = std::max(maxx, pt.x); maxy = std::max(maxy, pt.y);
         }
-        int w = std::max(1, maxx - minx), h = std::max(1, maxy - miny);
+        int w = std::max(1, maxx - minx + 1), h = std::max(1, maxy - miny + 1);
         rects.push_back({minx, miny, w, h, d.angle_deg, (double)w * h});
     }
     if (rects.size() > 1) {

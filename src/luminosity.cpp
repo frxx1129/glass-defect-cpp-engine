@@ -1,7 +1,7 @@
-﻿#include "engine/luminosity.h"
+#include "engine/luminosity.h"
 #include <opencv2/imgproc.hpp>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 
 std::vector<std::vector<cv::Point>> scan_edge_for_luminosity_defects(
     const cv::Mat& roi_gray,
@@ -34,7 +34,9 @@ std::vector<std::vector<cv::Point>> scan_edge_for_luminosity_defects(
     cv::Mat mask_minus = cv::Mat::zeros(roi_gray.size(), CV_8U);
     auto to_pts = [](std::initializer_list<cv::Point2d> pts) {
         std::vector<cv::Point> v;
-        for (auto& pt : pts) v.push_back(cv::Point((int)std::lround(pt.x), (int)std::lround(pt.y)));
+        // Python 用 np.int32 截断（向零），C++ 也须截断而非四舍五入，否则掩膜差 1px
+        // 导致 mean/std/阈值/梯度微差，边缘 B 判定翻转（如 cam1_ts1765488290697）。
+        for (auto& pt : pts) v.push_back(cv::Point((int)pt.x, (int)pt.y));
         return v;
     };
     cv::fillPoly(mask_plus, std::vector<std::vector<cv::Point>>{
@@ -65,13 +67,13 @@ std::vector<std::vector<cv::Point>> scan_edge_for_luminosity_defects(
     if (edge_ignore_px > 0.5) {
         int thickness = (int)std::ceil(edge_ignore_px);
         thickness = std::max(1, std::min(256, thickness));
-        cv::line(ignore_mask, cv::Point((int)std::lround(p1.x), (int)std::lround(p1.y)),
-                 cv::Point((int)std::lround(p2.x), (int)std::lround(p2.y)),
+        cv::line(ignore_mask, cv::Point((int)p1.x, (int)p1.y),
+                 cv::Point((int)p2.x, (int)p2.y),
                  cv::Scalar(255), thickness);
     }
-    cv::circle(ignore_mask, cv::Point((int)std::lround(p1.x), (int)std::lround(p1.y)),
+    cv::circle(ignore_mask, cv::Point((int)p1.x, (int)p1.y),
                (int)std::lround(endpoint_exclude_r), cv::Scalar(255), -1);
-    cv::circle(ignore_mask, cv::Point((int)std::lround(p2.x), (int)std::lround(p2.y)),
+    cv::circle(ignore_mask, cv::Point((int)p2.x, (int)p2.y),
                (int)std::lround(endpoint_exclude_r), cv::Scalar(255), -1);
 
     cv::Scalar mean, stddev;

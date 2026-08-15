@@ -45,6 +45,17 @@ struct LineMergingParams {
     bool vertical_across_angle_merge_enable = true;
     double duplicate_merge_max_offset_px = 2.0;
     double duplicate_merge_angle_tol_deg = 3.0;
+    // Canny snap（镜像 Python CANNY_SNAP_*，image_processor_hough.py:1079-1140）
+    bool canny_snap_enable = true;
+    int canny_snap_half_stripe_px = 4;
+    int canny_snap_min_points = 12;
+    double canny_snap_max_angle_diff_deg = 8.0;
+    // 水平轴向锁定先做 Canny 拟合（镜像 Python HORIZONTAL_LOCK_FIT_*，image_processor_hough.py:1583-1600）
+    bool horizontal_lock_fit_enable = true;
+    int horizontal_lock_fit_half_px = 4;
+    int horizontal_lock_fit_min_points = 18;
+    // 0 = 跟随 h_tol（DEFECT_DETECTION.VERTICAL_ANGLE_TOL_DEG，Python 默认 h_tol_deg）
+    double horizontal_lock_fit_max_angle_deg = 0.0;
 };
 
 struct CrackClassifyParams {
@@ -132,6 +143,9 @@ struct DefectDetectParams {
     int corner_max_extension_perp = 200;
     double perpendicular_angle_tolerance = 10.0;
     double vertical_angle_tol_deg = 15.0;
+    // E 检测"主边直接成 E"路径的近水平容差（镜像 Python E_INCLUDE_SKEW_MAIN_EDGES 段，
+    // HORIZONTAL_ANGLE_TOL_DEG 默认 10.0，与轮廓路径用 v_tol 不同）
+    double horizontal_angle_tol_deg = 10.0;
     double l_endpoint_belt_length_mm = 20.0;
 
     // 阴影 / B / L 过滤
@@ -156,6 +170,15 @@ struct DefectDetectParams {
     int reclassify_b_as_l_max_distance_px = 200;
     double reclassify_b_as_l_angle_tolerance = 15.0;
     double reclassify_b_as_l_endpoint_shield_ratio = 0.1;
+
+    // 跨 ROI 共享竖直边（镜像 Python CROSS_ROI_VERTICAL_*，image_processor_hough.py:6313-6541）
+    bool cross_roi_vertical_enabled = true;
+    double cross_roi_vertical_min_len_mm = 5.0;
+    double cross_roi_vertical_cluster_xpx = 12.0;
+    double cross_roi_vertical_slant_bias = 0.5;
+    bool cross_roi_vertical_prefer_global = true;
+    double cross_roi_vertical_replace_max_dist_mm = 10.0;
+    double cross_roi_vertical_replace_min_y_overlap_ratio = 0.15;
 
     // L / 裂纹分类
     double l_min_length_mm = 10.0;

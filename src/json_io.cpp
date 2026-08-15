@@ -55,6 +55,14 @@ static LineMergingParams parse_line_merging(const json& lm) {
     m.vertical_across_angle_merge_enable = get_b(lm, "VERTICAL_ACROSS_ANGLE_MERGE_ENABLE", true);
     m.duplicate_merge_max_offset_px = get_d(lm, "DUPLICATE_MERGE_MAX_OFFSET_PX", 2.0);
     m.duplicate_merge_angle_tol_deg = get_d(lm, "DUPLICATE_MERGE_ANGLE_TOL_DEG", 3.0);
+    m.canny_snap_enable = get_b(lm, "CANNY_SNAP_ENABLE", true);
+    m.canny_snap_half_stripe_px = get_i(lm, "CANNY_SNAP_HALF_STRIPE_PX", 4);
+    m.canny_snap_min_points = get_i(lm, "CANNY_SNAP_MIN_POINTS", 12);
+    m.canny_snap_max_angle_diff_deg = get_d(lm, "CANNY_SNAP_MAX_ANGLE_DIFF_DEG", 8.0);
+    m.horizontal_lock_fit_enable = get_b(lm, "HORIZONTAL_LOCK_FIT_ENABLE", true);
+    m.horizontal_lock_fit_half_px = get_i(lm, "HORIZONTAL_LOCK_FIT_HALF_PX", 4);
+    m.horizontal_lock_fit_min_points = get_i(lm, "HORIZONTAL_LOCK_FIT_MIN_POINTS", 18);
+    m.horizontal_lock_fit_max_angle_deg = get_d(lm, "HORIZONTAL_LOCK_MAX_ANGLE_DEV_DEG", 0.0);
     return m;
 }
 
@@ -132,6 +140,7 @@ static DefectDetectParams parse_defect_detection(const json& dd) {
     d.corner_max_extension_perp = get_i(dd, "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR", 200);
     d.perpendicular_angle_tolerance = get_d(dd, "PERPENDICULAR_ANGLE_TOLERANCE", 10.0);
     d.vertical_angle_tol_deg = get_d(dd, "VERTICAL_ANGLE_TOL_DEG", 15.0);
+    d.horizontal_angle_tol_deg = get_d(dd, "HORIZONTAL_ANGLE_TOL_DEG", 10.0);
     d.l_endpoint_belt_length_mm = get_d(dd, "L_ENDPOINT_BELT_LENGTH_MM", 20.0);
     d.shadow_filter_min_extent_ratio = get_d(dd, "SHADOW_FILTER_MIN_EXTENT_RATIO", 0.25);
     d.prefilter_min_width_mm = get_d(dd, "PREFILTER_MIN_WIDTH_MM", 5.0);
@@ -157,6 +166,14 @@ static DefectDetectParams parse_defect_detection(const json& dd) {
         d.reclassify_b_as_l_endpoint_shield_ratio = get_d(rb, "ENDPOINT_SHIELD_RATIO_FOR_EXTENDED", 0.1);
     }
     d.l_min_length_mm = get_d(dd, "L_MIN_LENGTH_MM", 10.0);
+    // 跨 ROI 共享竖直边（CROSS_ROI_VERTICAL_*，默认值同 Python）
+    d.cross_roi_vertical_enabled = get_b(dd, "CROSS_ROI_VERTICAL_ENABLED", true);
+    d.cross_roi_vertical_min_len_mm = get_d(dd, "CROSS_ROI_VERTICAL_MIN_LEN_MM", 5.0);
+    d.cross_roi_vertical_cluster_xpx = get_d(dd, "CROSS_ROI_VERTICAL_CLUSTER_XPX", 12.0);
+    d.cross_roi_vertical_slant_bias = get_d(dd, "CROSS_ROI_VERTICAL_SLANT_BIAS", 0.5);
+    d.cross_roi_vertical_prefer_global = get_b(dd, "CROSS_ROI_VERTICAL_PREFER_GLOBAL", true);
+    d.cross_roi_vertical_replace_max_dist_mm = get_d(dd, "CROSS_ROI_VERTICAL_REPLACE_MAX_DIST_MM", 10.0);
+    d.cross_roi_vertical_replace_min_y_overlap_ratio = get_d(dd, "CROSS_ROI_VERTICAL_REPLACE_MIN_Y_OVERLAP_RATIO", 0.15);
     d.static_artifact_enabled = get_b(dd, "STATIC_ARTIFACT_ENABLED", true);
     d.static_artifact_min_consecutive = get_i(dd, "STATIC_ARTIFACT_MIN_CONSECUTIVE", 100);
     d.static_artifact_grid_size = get_i(dd, "STATIC_ARTIFACT_GRID_SIZE", 60);

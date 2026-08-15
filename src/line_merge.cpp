@@ -2,6 +2,7 @@
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <iostream>
 #include <numeric>
 
@@ -157,7 +158,15 @@ inline void t_param_and_perp_dist(const cv::Point2d& pt, const cv::Point2d& a, c
     len = std::sqrt(denom);
 }
 
-// 两直线角度差（归一化到 [0, 90]）（镜像 Python diff_deg）
+// 真中位数（镜像 Python np.median：偶数个数取中间两值平均，不能用下中位数 xs[n/2]）
+inline double true_median(std::vector<double>& sorted_v) {
+    size_t n = sorted_v.size();
+    if (n == 0) return 0.0;
+    if (n % 2 == 1) return sorted_v[n / 2];
+    return 0.5 * (sorted_v[n / 2 - 1] + sorted_v[n / 2]);
+}
+
+// 两点直线角度差（归一化到 [0, 90]）（镜像 Python diff_deg）
 inline double angle_diff_deg(const cv::Vec4d& a, const cv::Vec4d& b) {
     auto ang = [](const cv::Vec4d& l) {
         double dx = l[2] - l[0], dy = l[3] - l[1];
@@ -167,6 +176,126 @@ inline double angle_diff_deg(const cv::Vec4d& a, const cv::Vec4d& b) {
     };
     double da = std::abs(ang(a) - ang(b));
     return std::min(da, 180.0 - da);
+}
+
+// 银行家舍入（.5 取偶数，镜像 Python round）
+inline int round_banker(double x) {
+    double r = std::floor(x);
+    double frac = x - r;
+    if (frac > 0.5 || (frac == 0.5 && std::fmod(r, 2.0) != 0.0)) r += 1.0;
+    return (int)r;
+}
+
+// Canny snap（镜像 Python _snap_line_to_canny，1079-1140）：
+// 在 Canny 边缘图上沿线段条带收集边缘点重拟合，减少角度与位置偏移。
+cv::Vec4d snap_line_to_canny(const cv::Vec4d& seg, const cv::Mat& edge_img,
+                             int stripe_half_px, int min_points, double max_angle_deg) {
+    if (edge_img.empty()) return seg;
+    int h_img = edge_img.rows, w_img = edge_img.cols;
+    if (h_img <= 0 || w_img <= 0) return seg;
+    cv::Mat edge_bin;
+    if (edge_img.type() != CV_8U) {
+        cv::compare(edge_img, 0, edge_bin, cv::CMP_GT);
+    } else {
+        edge_bin = edge_img;
+    }
+    int thickness = std::max(1, stripe_half_px * 2 + 1);
+    cv::Mat mask = cv::Mat::zeros(h_img, w_img, CV_8U);
+    cv::line(mask,
+             cv::Point(round_banker(seg[0]), round_banker(seg[1])),
+             cv::Point(round_banker(seg[2]), round_banker(seg[3])),
+             cv::Scalar(255), thickness);
+    cv::Mat overlap;
+    cv::bitwise_and(edge_bin, mask, overlap);
+    std::vector<cv::Point2f> pts;
+    for (int y = 0; y < h_img; y++) {
+        const uchar* row = overlap.ptr<uchar>(y);
+        for (int x = 0; x < w_img; x++)
+            if (row[x] > 0) pts.emplace_back((float)x, (float)y);
+    }
+    if ((int)pts.size() < std::max(2, min_points)) return seg;
+    cv::Vec4f fit;
+    try { cv::fitLine(pts, fit, cv::DIST_L2, 0, 0.01, 0.01); }
+    catch (...) { return seg; }
+#ifdef CPP_DEBUG_MERGED
+    {
+        std::cerr << "  [SNAP-FIT] npts=" << pts.size() << " dir=(" << std::fixed << std::setprecision(8)
+                  << fit[0] << "," << fit[1] << ") base=(" << fit[2] << "," << fit[3] << ")"
+                  << std::defaultfloat << std::endl;
+    }
+#endif
+    double vx = fit[0], vy = fit[1], x0 = fit[2], y0 = fit[3];
+    double norm = std::hypot(vx, vy);
+    if (norm < 1e-6) return seg;
+    vx /= norm; vy /= norm;
+    double angle_old = std::atan2(seg[3] - seg[1], seg[2] - seg[0]) * 180.0 / CV_PI;
+    if (angle_old < 0) angle_old += 180.0;
+    double angle_new = std::atan2(vy, vx) * 180.0 / CV_PI;
+    if (angle_new < 0) angle_new += 180.0;
+    double angle_diff = std::abs(angle_new - angle_old);
+    if (angle_diff > 90.0) angle_diff = 180.0 - angle_diff;
+    if (angle_diff > max_angle_deg) return seg;
+    cv::Point2d base(x0, y0), dir(vx, vy);
+    auto proj = [&](const cv::Point2d& pt) { return (pt.x - base.x) * dir.x + (pt.y - base.y) * dir.y; };
+    cv::Point2d p1(seg[0], seg[1]), p2(seg[2], seg[3]);
+    double t1 = proj(p1), t2 = proj(p2);
+    double t_min = std::min(t1, t2), t_max = std::max(t1, t2);
+    cv::Point2d np1 = base + t_min * dir, np2 = base + t_max * dir;
+    np1.x = std::clamp(np1.x, 0.0, (double)(w_img - 1));
+    np1.y = std::clamp(np1.y, 0.0, (double)(h_img - 1));
+    np2.x = std::clamp(np2.x, 0.0, (double)(w_img - 1));
+    np2.y = std::clamp(np2.y, 0.0, (double)(h_img - 1));
+    return cv::Vec4d(np1.x, np1.y, np2.x, np2.y);
+}
+
+// 水平锁定前的 Canny 线拟合（镜像 Python _fit_line_from_edges，1143-1189）：
+// 在水平段附近的带状区域内收集 Canny 点拟合直线，允许轻微斜率以贴合真实边缘。
+// 拟合角度超过 max_angle_dev_deg 或点数不足时返回 false（保持原段）。
+bool fit_line_from_edges(const cv::Mat& edge_img, const cv::Vec4d& seg,
+                         int band_half, int min_points, double max_angle_dev_deg,
+                         cv::Vec4d& out) {
+    if (edge_img.empty()) return false;
+    int H = edge_img.rows, W = edge_img.cols;
+    if (H <= 0 || W <= 0) return false;
+    band_half = std::max(1, band_half);
+    double x1 = seg[0], y1 = seg[1], x2 = seg[2], y2 = seg[3];
+    int x_min = std::max(0, (int)std::floor(std::min(x1, x2)));
+    int x_max = std::min(W - 1, (int)std::ceil(std::max(x1, x2)));
+    int y_med = round_banker(0.5 * (y1 + y2));
+    int y0 = std::max(0, y_med - band_half);
+    int y1b = std::min(H - 1, y_med + band_half);
+    if (x_max - x_min < 1 || y1b - y0 < 1) return false;
+    std::vector<cv::Point2f> pts;
+    for (int yy = y0; yy <= y1b; yy++) {
+        const uchar* row = edge_img.ptr<uchar>(yy);
+        for (int xx = x_min; xx <= x_max; xx++)
+            if (row[xx] > 0) pts.emplace_back((float)xx, (float)yy);
+    }
+    if ((int)pts.size() < std::max(2, min_points)) return false;
+    cv::Vec4f fit;
+    try { cv::fitLine(pts, fit, cv::DIST_L2, 0, 0.01, 0.01); }
+    catch (...) { return false; }
+    double vx = fit[0], vy = fit[1], cx = fit[2], cy = fit[3];
+    double norm = std::hypot(vx, vy);
+    if (norm < 1e-6) return false;
+    vx /= norm; vy /= norm;
+    double ang = std::abs(std::atan2(vy, vx) * 180.0 / CV_PI);
+    if (ang > 90.0) ang = 180.0 - ang;
+    if (ang > max_angle_dev_deg) return false;
+    cv::Point2d base(cx, cy), dir(vx, vy);
+    double t_min = 1e18, t_max = -1e18;
+    for (auto& pt : pts) {
+        double t = (pt.x - base.x) * dir.x + (pt.y - base.y) * dir.y;
+        t_min = std::min(t_min, t);
+        t_max = std::max(t_max, t);
+    }
+    cv::Point2d p1n = base + t_min * dir, p2n = base + t_max * dir;
+    p1n.x = std::clamp(p1n.x, 0.0, (double)(W - 1));
+    p1n.y = std::clamp(p1n.y, 0.0, (double)(H - 1));
+    p2n.x = std::clamp(p2n.x, 0.0, (double)(W - 1));
+    p2n.y = std::clamp(p2n.y, 0.0, (double)(H - 1));
+    out = cv::Vec4d(p1n.x, p1n.y, p2n.x, p2n.y);
+    return true;
 }
 
 } // namespace
@@ -291,7 +420,7 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                 }
                 std::sort(xs.begin(), xs.end());
                 std::vector<double> devs;
-                double x_med = xs[xs.size() / 2];
+                double x_med = true_median(xs);
                 for (double x : xs) devs.push_back(std::abs(x - x_med));
                 std::sort(devs.begin(), devs.end());
                 double x_mad = devs[devs.size() / 2] * 2.0;
@@ -313,11 +442,24 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                     if (ec.active && early_cluster_id(ec, xi) != early_cluster_id(ec, xj)) continue;
                     double dyn_allow = std::max(vertical_thick_merge_px, 1.5 * (xi_mad + xj_mad));
                     if (vertical_thick_merge_cap_px > 0) dyn_allow = std::min(dyn_allow, vertical_thick_merge_cap_px);
+#ifdef CPP_DEBUG_MERGED
+                    std::cerr << "  [VTHICK] xi=" << xi << " xj=" << xj << " dyn=" << dyn_allow
+                              << " yi=" << yi0 << "-" << yi1 << " yj=" << yj0 << "-" << yj1
+                              << " ec_active=" << ec.active
+                              << " ec_thresh=" << ec.x_thresh
+                              << " cid_i=" << (ec.active ? early_cluster_id(ec, xi) : -1)
+                              << " cid_j=" << (ec.active ? early_cluster_id(ec, xj) : -1)
+                              << std::endl;
+#endif
                     if (std::abs(xi - xj) <= dyn_allow) {
                         double overlap = std::max(0.0, std::min(yi1, yj1) - std::max(yi0, yj0));
                         double span = std::max(1.0, std::max(yi1, yj1) - std::min(yi0, yj0));
                         double min_overlap = p.vertical_thick_min_overlap_ratio > 0
                             ? p.vertical_thick_min_overlap_ratio : 0.2;
+#ifdef CPP_DEBUG_MERGED
+                        std::cerr << "  [VTHICK-M] overlap=" << (overlap / span)
+                                  << " min_overlap=" << min_overlap << std::endl;
+#endif
                         if ((overlap / span) >= min_overlap) {
                             cur.insert(cur.end(), proximity_groups[j].begin(), proximity_groups[j].end());
                             used[j] = true;
@@ -370,12 +512,19 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
             if (!edge_img.empty()) {
                 int h_img = edge_img.rows, w_img = edge_img.cols;
                 if (nv) {
-                    int y0s = std::max(0, (int)std::floor(p_min.y));
-                    int y1s = std::min(h_img - 1, (int)std::ceil(p_max.y));
+                    // 镜像 Python：y 范围用原始点的 min/max（不能用投影端点 p_min/p_max，
+                    // 否则 fitLine 方向符号翻转时 y0>y1 导致锁定失效）
+                    double pts_min_y = 1e18, pts_max_y = -1e18;
+                    for (auto& pt : pts) {
+                        pts_min_y = std::min(pts_min_y, (double)pt.y);
+                        pts_max_y = std::max(pts_max_y, (double)pt.y);
+                    }
+                    int y0s = std::max(0, (int)std::floor(pts_min_y));
+                    int y1s = std::min(h_img - 1, (int)std::ceil(pts_max_y));
                     std::vector<double> xs;
                     for (auto& ln : group) { xs.push_back(ln[0]); xs.push_back(ln[2]); }
                     std::sort(xs.begin(), xs.end());
-                    int x_med = (int)std::lround(xs[xs.size() / 2]);
+                    int x_med = round_banker(true_median(xs));
                     int cx_best = x_med; int best_sum = -1;
                     for (int cx = std::max(0, x_med - (int)canny_refine_half_px);
                          cx <= std::min(w_img - 1, x_med + (int)canny_refine_half_px); cx++) {
@@ -386,21 +535,49 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                     }
                     final_line = cv::Vec4d(cx_best, y0s, cx_best, y1s);
                 } else if (nh) {
-                    int x0s = std::max(0, (int)std::floor(p_min.x));
-                    int x1s = std::min(w_img - 1, (int)std::ceil(p_max.x));
+                    // 镜像 Python：x 范围用原始点的 min/max
+                    double pts_min_x = 1e18, pts_max_x = -1e18;
+                    for (auto& pt : pts) {
+                        pts_min_x = std::min(pts_min_x, (double)pt.x);
+                        pts_max_x = std::max(pts_max_x, (double)pt.x);
+                    }
+                    int x0s = std::max(0, (int)std::floor(pts_min_x));
+                    int x1s = std::min(w_img - 1, (int)std::ceil(pts_max_x));
                     std::vector<double> ys;
                     for (auto& ln : group) { ys.push_back(ln[1]); ys.push_back(ln[3]); }
                     std::sort(ys.begin(), ys.end());
-                    int y_med = (int)std::lround(ys[ys.size() / 2]);
-                    int cy_best = y_med; int best_sum = -1;
-                    for (int cy = std::max(0, y_med - (int)canny_refine_half_px);
-                         cy <= std::min(h_img - 1, y_med + (int)canny_refine_half_px); cy++) {
-                        int row_sum = 0;
-                        for (int xx = x0s; xx <= x1s; xx++)
-                            if (edge_img.at<uchar>(cy, xx) > 0) row_sum++;
-                        if (row_sum > best_sum) { best_sum = row_sum; cy_best = cy; }
+                    int y_med = round_banker(true_median(ys));
+                    int cy_best = y_med;
+                    // 先尝试 Canny 带状拟合（镜像 Python HORIZONTAL_LOCK_FIT_*，1583-1600）：允许轻微斜率贴合真实边缘，
+                    // 否则锁定成完全水平会误屏蔽斜向主边（如 cam-1_ts1765689131686 底部 10.65° 边缘 → E 漏检）
+                    bool fitted_ok = false;
+                    if (p.horizontal_lock_fit_enable && !edge_img.empty()) {
+                        cv::Vec4d fitted;
+                        double fit_max_ang = p.horizontal_lock_fit_max_angle_deg > 0
+                            ? p.horizontal_lock_fit_max_angle_deg : h_tol;
+                        if (fit_line_from_edges(edge_img,
+                                               cv::Vec4d((double)x0s, (double)y_med, (double)x1s, (double)y_med),
+                                               p.horizontal_lock_fit_half_px,
+                                               p.horizontal_lock_fit_min_points,
+                                               fit_max_ang, fitted)) {
+                            final_line = fitted;
+                            cy_best = round_banker(0.5 * (fitted[1] + fitted[3]));
+                            fitted_ok = true;
+                        }
                     }
-                    final_line = cv::Vec4d(x0s, cy_best, x1s, cy_best);
+                    if (!fitted_ok) {
+                        // 拟合未生效（禁用/失败）：回退到行计数锁定
+                        int best_sum = -1;
+                        for (int cy = std::max(0, y_med - (int)canny_refine_half_px);
+                             cy <= std::min(h_img - 1, y_med + (int)canny_refine_half_px); cy++) {
+                            int row_sum = 0;
+                            for (int xx = x0s; xx <= x1s; xx++)
+                                if (edge_img.at<uchar>(cy, xx) > 0) row_sum++;
+                            if (row_sum > best_sum) { best_sum = row_sum; cy_best = cy; }
+                        }
+                        if (cy_best < 0) cy_best = y_med;
+                        final_line = cv::Vec4d(x0s, cy_best, x1s, cy_best);
+                    }
 
                     // 水平连接性校验（镜像 Python HORIZONTAL_CONNECTIVITY）：
                     // group 内线段按 x 投影排序，相邻段 gap>=8px 且 Canny 无边缘连续>=25px -> 拆回最长段
@@ -456,6 +633,26 @@ std::vector<MergedLine> merge_lines_and_get_main_edges(
                             final_line = cv::Vec4d((*best_ln)[0], (*best_ln)[1], (*best_ln)[2], (*best_ln)[3]);
                         }
                     }
+                }
+            }
+
+            // Canny snap（镜像 Python _snap_line_to_canny，1893-1901）：近竖直/近水平主边
+            // 用 Canny 边缘点重拟合，减少角度与位置偏移（影响后续 B 扫描带等位置敏感步骤）
+            if (!edge_img.empty() && p.canny_snap_enable && p.canny_snap_half_stripe_px > 0) {
+                double ang_now = line_angle_deg(final_line);
+                bool nv_now = is_near_vertical(ang_now, v_tol);
+                bool nh_now = is_near_horizontal(ang_now, h_tol);
+                if (nv_now || nh_now) {
+#ifdef CPP_DEBUG_MERGED
+                    std::cerr << "  [SNAP-IN] (" << std::fixed << std::setprecision(3)
+                              << final_line[0] << "," << final_line[1] << ")->("
+                              << final_line[2] << "," << final_line[3] << ")"
+                              << std::defaultfloat << std::endl;
+#endif
+                    final_line = snap_line_to_canny(final_line, edge_img,
+                                                    p.canny_snap_half_stripe_px,
+                                                    p.canny_snap_min_points,
+                                                    p.canny_snap_max_angle_diff_deg);
                 }
             }
 
